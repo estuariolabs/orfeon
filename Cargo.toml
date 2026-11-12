@@ -1,9 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/orfeon-core", "crates/orfeon-cli"]
-# El plugin vive en su propio espacio de trabajo (plugin/): trae nih-plug, que no hace falta
-# para el núcleo ni para la línea de comandos.
-exclude = ["plugin"]
+members = ["crates/orfeon-core", "crates/orfeon-cli", "crates/orfeon-plugin", "xtask"]
 
 [workspace.package]
 version = "0.1.0"

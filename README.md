@@ -13,7 +13,7 @@ de Jameson Hodge (MIT), usado como dependencia sin modificar. Ver [`NOTICE.md`](
 |---|---|
 | Núcleo (`crates/orfeon-core`) | Compila. 12 tests pasan. |
 | Línea de comandos (`crates/orfeon-cli`) | Compila y rinde audio. Es la forma verificada de escucharlo. |
-| Plugin CLAP / VST3 (`plugin/`) | **Escrito pero nunca compilado ni cargado en un DAW.** Puede necesitar correcciones. |
+| Plugin CLAP / VST3 (`crates/orfeon-plugin`) | Compila y se empaqueta (probado en Linux). **Nunca se cargó en un DAW.** |
 | Sonido | Nadie lo escuchó todavía: estilos, programas y niveles se eligieron a mano y por medición. |
 
 ## Qué hace
@@ -78,15 +78,14 @@ cargo run --release -p orfeon-cli -- bench --eco
 Mide la carga para 1, 2, 4, 8, 16, 32 y 64 voces. Por debajo de ~70 % se puede tocar en vivo.
 Usá el resultado para fijar "Voces a la vez" en el plugin.
 
-### 3. El plugin (sin verificar)
+### 3. El plugin
 
 ```sh
-cd plugin
 cargo xtask bundle orfeon-plugin --release
 ```
 
-Si compila, deja `plugin/target/bundled/Orfeon.clap` y `Orfeon.vst3`. Copialos a la carpeta
-de plugins del sistema:
+Deja `target/bundled/Orfeon.clap` y `Orfeon.vst3` para el sistema donde lo compiles (hay que
+compilarlo en Windows para Windows, en macOS para macOS). Copialos a la carpeta de plugins:
 
 | Sistema | CLAP | VST3 |
 |---|---|---|
@@ -104,9 +103,10 @@ Qué probar, en este orden:
 6. Mirar el medidor de CPU del DAW con 4 y 8 notas. Si se entrecorta: bajar "Voces a la vez",
    poner "Calidad" en `Eco`, o subir el tamaño de buffer del DAW.
 
-No tiene interfaz propia: los controles aparecen en el editor genérico del DAW. Si la
-compilación falla, el error casi seguro está en `plugin/orfeon-plugin/src/lib.rs`, que es lo
-único que habla con nih-plug; el resto del proyecto no depende de él.
+No tiene interfaz propia: los controles aparecen en el editor genérico del DAW. La
+compilación y el empaquetado se probaron sólo en Linux; cargarlo y tocarlo en un DAW no se
+probó en ningún sistema. Todo lo que habla con el DAW está en
+`crates/orfeon-plugin/src/lib.rs`.
 
 ## Cuánto cuesta
 
@@ -161,7 +161,8 @@ crates/orfeon-core/     el coro (sin E/S)
   preset.rs             los 36 programas
   tests/choir.rs        tests
 crates/orfeon-cli/      rinde WAV, lista programas, mide la carga
-plugin/                 espacio de trabajo aparte: plugin CLAP/VST3 (nih-plug) y su empaquetador
+crates/orfeon-plugin/   plugin CLAP/VST3 (nih-plug)
+xtask/                  empaquetador del plugin (`cargo xtask bundle`)
 ```
 
 - **Del rostro a la voz.** CHIMERA simula un tracto a partir de cuatro medidas (tamaño, largo
