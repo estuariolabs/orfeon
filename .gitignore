@@ -1,0 +1,3 @@
+target/
+plugin/target/
+*.wav

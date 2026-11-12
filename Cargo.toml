@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["crates/orfeon-core", "crates/orfeon-cli"]
+# El plugin vive en su propio espacio de trabajo (plugin/): trae nih-plug, que no hace falta
+# para el núcleo ni para la línea de comandos.
+exclude = ["plugin"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+# Motor de voz por modelado físico (MIT, Jameson Hodge). Fijado a un commit.
+chimera = { git = "https://github.com/jamesondh/chimera-vocal-synth", rev = "edd2676" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

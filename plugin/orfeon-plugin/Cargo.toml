@@ -1,0 +1,14 @@
+[package]
+name = "orfeon-plugin"
+description = "Orfeón: coro de cantantes modelados físicamente (CLAP y VST3)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+orfeon-core = { path = "../../crates/orfeon-core" }
+# Marco para plugins CLAP/VST3 en Rust (ISC). La parte VST3 usa vst3-sys (GPL-3.0).
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git" }

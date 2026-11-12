@@ -1,0 +1,13 @@
+[package]
+name = "orfeon-cli"
+description = "Orfeón por línea de comandos: rinde coros a WAV, lista programas y mide la carga"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "orfeon"
+path = "src/main.rs"
+
+[dependencies]
+orfeon-core = { path = "../orfeon-core" }
