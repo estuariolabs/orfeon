@@ -176,7 +176,7 @@ pub fn show(ctx: &egui::Context, m: &mut Model, tel: &Telemetry, host: Option<&S
                 None => "Manual".to_string(),
             };
             let mut pick = None;
-            egui::ComboBox::from_id_salt("orfeon-programa").width(230.0).selected_text(RichText::new(name).strong()).height(520.0).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("orfeon-programa").width(190.0).selected_text(RichText::new(name).strong()).height(520.0).show_ui(ui, |ui| {
                 for (i, p) in PRESETS.iter().enumerate() {
                     let label = format!("{:2}  {}   ·  {} {}", i + 1, p.name, p.params.singers, if p.params.singers == 1 { "voz" } else { "voces" });
                     if ui.selectable_label(m.preset == Some(i), label).clicked() {
@@ -201,14 +201,14 @@ pub fn show(ctx: &egui::Context, m: &mut Model, tel: &Telemetry, host: Option<&S
                 }
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().slider_width = 92.0;
                 let mut db = m.params.gain_db as f32;
                 if ui.add(Slider::new(&mut db, -36.0..=12.0).suffix(" dB").custom_formatter(|v, _| format!("{v:.1}"))).on_hover_text("volumen").changed() {
                     m.params.gain_db = db as f64;
                 }
                 ui.label(RichText::new("Vol").color(DIM));
                 ui.add_space(8.0);
-                widgets::meter(ui, 110.0, tel.load, &format!("CPU {:.0} %", tel.load * 100.0));
-                ui.label(RichText::new(format!("{} / {} voces", tel.voices, m.params.max_voices)).color(DIM));
+                widgets::meter(ui, 88.0, tel.load, &format!("CPU {:.0} %", tel.load * 100.0));
                 if let Some(u) = tel.underruns {
                     if u > 0 {
                         ui.label(RichText::new(format!("{u} cortes")).color(WARN)).on_hover_text("veces que el audio no llegó a tiempo: ver Ajustes");
