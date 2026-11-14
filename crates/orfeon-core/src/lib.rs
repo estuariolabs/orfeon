@@ -7,6 +7,7 @@
 
 pub mod choir;
 pub mod console;
+pub mod lyrics;
 pub mod preset;
 pub mod rng;
 pub mod room;
@@ -14,7 +15,7 @@ pub mod singer;
 pub mod style;
 pub mod vowel;
 
-pub use choir::{Choir, ChoirParams, Mode, Quality};
+pub use choir::{Choir, ChoirParams, Mode, Part, Quality, PART_COUNT};
 pub use preset::{Preset, PRESETS};
 pub use room::RoomKind;
 pub use singer::{Ensemble, Face, Singer, VoiceType};

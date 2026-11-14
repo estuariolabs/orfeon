@@ -33,15 +33,18 @@ pub struct Model {
     pub preset: Option<usize>,
     pub selected: usize,
     pub tab: Tab,
+    pub lyrics: [String; 4],
+    pub words: [String; 4],
+    pub lyrics_status: String,
     /// tecla que el mouse tiene apretada en el teclado de pantalla
-    kb_note: Option<u8>,
+    kb_note: Option<(u8, usize)>,
     /// fase del movimiento de la vocal (sólo para dibujar)
     phase: f32,
 }
 
 impl Model {
     pub fn new(params: ChoirParams, preset: Option<usize>) -> Model {
-        Model { params, preset, selected: 0, tab: Tab::Cantante, kb_note: None, phase: 0.0 }
+        Model { params, preset, selected: 0, tab: Tab::Cantante, lyrics: Default::default(), words: Default::default(), lyrics_status: String::new(), kb_note: None, phase: 0.0 }
     }
 }
 
@@ -80,12 +83,16 @@ pub struct Standalone {
 /// Pedidos de la pantalla al motor.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
-    NoteOn(u8, f32),
-    NoteOff(u8),
+    NoteOn(u8, f32, usize),
+    NoteOff(u8, usize),
     AllOff,
     Threads(usize),
     Latency(u32),
     Midi(usize),
+    ApplyLyrics,
+    ResetLyrics,
+    SaveQuartet,
+    OpenQuartet,
 }
 
 fn note_name(k: u8) -> String {
@@ -185,9 +192,11 @@ pub fn show(ctx: &egui::Context, m: &mut Model, tel: &Telemetry, host: Option<&S
                 load_preset(m, i);
             }
             ui.add_space(14.0);
-            for (mode, label, tip) in [(Mode::Coro, "Coro", "cada nota va a otro cantante"), (Mode::Tutti, "Tutti", "todos cantan la última nota, cada uno en su octava"), (Mode::Solo, "Solo", "un cantante, ligado")] {
+            for (mode, label, tip) in [(Mode::Coro, "Coro", "cada nota va a otro cantante"), (Mode::Tutti, "Tutti", "todos cantan la última nota, cada uno en su octava"), (Mode::Solo, "Solo", "un cantante, ligado"), (Mode::Partes, "Cuarteto", "cuatro cantantes con entradas independientes")] {
                 if ui.selectable_label(m.params.mode == mode, label).on_hover_text(tip).clicked() && m.params.mode != mode {
                     m.params.mode = mode;
+                    m.selected = 0;
+                    m.tab = Tab::Cantante;
                     events.push(Event::AllOff);
                 }
             }
@@ -217,21 +226,25 @@ pub fn show(ctx: &egui::Context, m: &mut Model, tel: &Telemetry, host: Option<&S
     // ---------------- teclado ----------------
     egui::TopBottomPanel::bottom("orfeon-teclado").exact_height(112.0).frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::symmetric(12, 8))).show(ctx, |ui| {
         let mut types: Vec<VoiceType> = Vec::new();
-        for i in 0..m.params.singers.clamp(1, MAX_SINGERS) {
-            let t = m.params.ensemble.voice_type(i);
+        let (ensemble, count) = m.params.elenco();
+        let part_mode = m.params.mode == Mode::Partes;
+        for i in 0..count {
+            if part_mode && i != m.selected.min(3) { continue; }
+            let t = ensemble.voice_type(i);
             if !types.contains(&t) {
                 types.push(t);
             }
         }
         types.sort_by_key(|t| t.range().0);
         let w = ui.available_width();
-        let now = widgets::keyboard(ui, vec2(w, 96.0), &tel.held, &types);
+        let now = widgets::keyboard(ui, vec2(w, 96.0), &tel.held, &types)
+            .map(|key| (key, if part_mode { m.selected.min(3) } else { 0 }));
         if now != m.kb_note {
-            if let Some(k) = m.kb_note {
-                events.push(Event::NoteOff(k));
+            if let Some((k, part)) = m.kb_note {
+                events.push(Event::NoteOff(k, part));
             }
-            if let Some(k) = now {
-                events.push(Event::NoteOn(k, 0.75));
+            if let Some((k, part)) = now {
+                events.push(Event::NoteOn(k, 0.75, part));
             }
             m.kb_note = now;
         }
@@ -239,6 +252,19 @@ pub fn show(ctx: &egui::Context, m: &mut Model, tel: &Telemetry, host: Option<&S
 
     // ---------------- elenco (izquierda) ----------------
     egui::SidePanel::left("orfeon-elenco").exact_width(356.0).resizable(false).frame(egui::Frame::new().fill(PANEL).inner_margin(egui::Margin::same(12))).show(ctx, |ui| {
+        if m.params.mode == Mode::Partes {
+            ui.heading("Cuarteto");
+            ui.add_space(12.0);
+            for (i, name) in PART_NAMES.iter().enumerate() {
+                let part = m.params.parts[i];
+                let label = format!("{}     {}–{}\nCanal {} · {}", name, note_name(part.low), note_name(part.high), i + 1, part.style.def().name);
+                if ui.add_sized([320.0, 52.0], egui::Button::new(label).selected(i == m.selected)).clicked() {
+                    m.selected = i;
+                    m.tab = Tab::Cantante;
+                }
+            }
+            return;
+        }
         const INNER: f32 = 332.0;
         // el marco del panel se pinta alrededor del contenido: que ocupe todo el ancho
         ui.set_min_width(ui.available_width());
@@ -302,6 +328,7 @@ pub fn show(ctx: &egui::Context, m: &mut Model, tel: &Telemetry, host: Option<&S
         });
         ui.separator();
         match m.tab {
+            Tab::Cantante if m.params.mode == Mode::Partes => tab_part(ui, m, tel, events, host.is_some()),
             Tab::Cantante => tab_singer(ui, m, tel),
             Tab::Voz => tab_voice(ui, m),
             Tab::Vocal => tab_vowel(ui, m),
@@ -314,6 +341,55 @@ pub fn show(ctx: &egui::Context, m: &mut Model, tel: &Telemetry, host: Option<&S
         events.push(Event::AllOff);
     }
     m.params != before
+}
+
+const PART_NAMES: [&str; 4] = ["Soprano", "Bajo", "Contralto", "Tenor"];
+
+fn tab_part(ui: &mut Ui, m: &mut Model, tel: &Telemetry, events: &mut Vec<Event>, standalone: bool) {
+    let i = m.selected.min(PART_NAMES.len() - 1);
+    let part = &mut m.params.parts[i];
+    ui.heading(PART_NAMES[i]);
+    ui.label(format!("Entrada MIDI por canal {} · teclado de pantalla", i + 1));
+    widgets::meter(ui, 160.0, tel.levels[i], "Nivel");
+    ui.add_space(12.0);
+    section(ui, "Registro");
+    ui.horizontal(|ui| {
+        ui.label("Desde");
+        ui.add(egui::DragValue::new(&mut part.low).range(0..=part.high).custom_formatter(|v, _| note_name(v as u8)).custom_parser(parse_note_name));
+        ui.label("Hasta");
+        ui.add(egui::DragValue::new(&mut part.high).range(part.low..=127).custom_formatter(|v, _| note_name(v as u8)).custom_parser(parse_note_name));
+    });
+    section(ui, "Preset vocal");
+    egui::ComboBox::from_id_salt("orfeon-part-style").selected_text(part.style.def().name).show_ui(ui, |ui| {
+        for style in Style::ALL {
+            ui.selectable_value(&mut part.style, style, style.def().name);
+        }
+    });
+    ui.add_space(14.0);
+    section(ui, "Letra de este cantante");
+    ui.add(egui::TextEdit::singleline(&mut m.words[i]).hint_text("Escribí en español, por ejemplo Canta al sol").desired_width(f32::INFINITY).char_limit(512));
+    if ui.button("Convertir a sílabas").clicked() {
+        m.lyrics[i] = orfeon_core::lyrics::spanish_ipa(&m.words[i]);
+    }
+    ui.label("Pronunciación IPA · puntos entre sílabas, – para prolongar (escribí -)");
+    ui.add(egui::TextEdit::multiline(&mut m.lyrics[i]).desired_rows(3).desired_width(f32::INFINITY).char_limit(2048));
+    ui.horizontal(|ui| {
+        if ui.button("Aplicar letras").clicked() { events.push(Event::ApplyLyrics); }
+        if ui.button("Reiniciar cursores").clicked() { events.push(Event::ResetLyrics); }
+        if standalone {
+            if ui.button("Guardar cuarteto").clicked() { events.push(Event::SaveQuartet); }
+            if ui.button("Abrir cuarteto").clicked() { events.push(Event::OpenQuartet); }
+        }
+    });
+    if !m.lyrics_status.is_empty() {
+        ui.label(&m.lyrics_status);
+    }
+}
+
+fn parse_note_name(text: &str) -> Option<f64> {
+    text.parse::<f64>().ok().or_else(|| {
+        (0u8..=127).find(|&n| text.eq_ignore_ascii_case(&note_name(n))).map(f64::from)
+    })
 }
 
 fn face_sliders(ui: &mut Ui, f: &mut Face) -> bool {

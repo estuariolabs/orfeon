@@ -7,6 +7,7 @@
 //! Cada cantante sonando cuesta una simulación completa del motor de CHIMERA. Por eso las
 //! voces se calculan en paralelo (`threads`) y hay un tope de voces simultáneas (`max_voices`).
 
+use crate::lyrics::{self, Lyrics, SungSyllable};
 use crate::rng::Rng;
 use crate::room::{Room, RoomKind};
 use crate::singer::{Ensemble, Face, Singer};
@@ -41,15 +42,17 @@ pub enum Mode {
     Tutti,
     /// un solo cantante, ligado
     Solo,
+    Partes,
 }
 
 impl Mode {
-    pub const ALL: [Mode; 3] = [Mode::Coro, Mode::Tutti, Mode::Solo];
+    pub const ALL: [Mode; 4] = [Mode::Coro, Mode::Tutti, Mode::Solo, Mode::Partes];
     pub fn name(self) -> &'static str {
         match self {
             Mode::Coro => "Coro",
             Mode::Tutti => "Tutti",
             Mode::Solo => "Solo",
+            Mode::Partes => "Partes",
         }
     }
     pub fn from_index(i: usize) -> Mode {
@@ -65,10 +68,31 @@ pub enum Quality {
     Eco,
 }
 
+pub const PART_COUNT: usize = 4;
+
+/// Una parte se toca por su canal (1 a 4 según su posición).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Part {
+    pub low: u8,
+    pub high: u8,
+    pub style: Style,
+}
+
+impl Part {
+    // Orden existente del elenco mixto: soprano, bajo, contralto, tenor.
+    pub const SATB: [Self; PART_COUNT] = [
+        Self { low: 60, high: 84, style: Style::Clasico },
+        Self { low: 40, high: 64, style: Style::Antiguo },
+        Self { low: 53, high: 77, style: Style::Folk },
+        Self { low: 48, high: 72, style: Style::Pop },
+    ];
+}
+
 /// Todo lo que se puede ajustar. Los campos marcados (estructural) reconstruyen las voces.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ChoirParams {
     pub mode: Mode,
+    pub parts: [Part; PART_COUNT],
     /// cantantes definidos, 1..64 (estructural)
     pub singers: usize,
     /// (estructural)
@@ -121,6 +145,7 @@ pub struct ChoirParams {
 impl ChoirParams {
     pub const DEFAULT: ChoirParams = ChoirParams {
         mode: Mode::Coro,
+        parts: Part::SATB,
         singers: 8,
         ensemble: Ensemble::Mixto,
         seed: 1,
@@ -152,9 +177,9 @@ impl ChoirParams {
     /// El cantante `i` tal como lo arma el coro con estos parámetros (sin crear su voz).
     /// Sirve para dibujarlo.
     pub fn singer(&self, i: usize) -> Singer {
-        let n = self.singers.clamp(1, MAX_SINGERS);
+        let (ensemble, n) = self.elenco();
         let i = i.min(MAX_SINGERS - 1);
-        Singer::with_face(self.ensemble, i, n, self.seed, self.face, self.variation, self.custom[i])
+        Singer::with_face(ensemble, i, n, self.seed, self.face, self.variation, self.custom[i])
     }
 
     /// ¿Mismos parámetros salvo lo que depende de la máquina (tope de voces, calidad, volumen)?
@@ -162,8 +187,17 @@ impl ChoirParams {
         ChoirParams { max_voices: o.max_voices, quality: o.quality, gain_db: o.gain_db, ..*self } == *o
     }
 
+    pub fn elenco(&self) -> (Ensemble, usize) {
+        if self.mode == Mode::Partes {
+            (Ensemble::Mixto, PART_COUNT)
+        } else {
+            (self.ensemble, self.singers.clamp(1, MAX_SINGERS))
+        }
+    }
+
     fn structural(&self) -> (usize, Ensemble, u32, Face, u64, Quality) {
-        (self.singers.clamp(1, MAX_SINGERS), self.ensemble, self.seed, self.face, self.variation.to_bits(), self.quality)
+        let (ensemble, singers) = self.elenco();
+        (singers, ensemble, self.seed, self.face, self.variation.to_bits(), self.quality)
     }
 }
 
@@ -192,6 +226,8 @@ struct Ctl {
 /// Un cantante con su voz y el estado de lo que está cantando.
 struct Slot {
     singer: Singer,
+    part_style: Option<StyleDef>,
+    sung: bool,
     voice: HumanVoice,
     space: VowelSpace,
     // remuestreo del modo Eco
@@ -238,6 +274,8 @@ impl Slot {
         let efs = if eco { ECO_RATE } else { fs };
         Slot {
             singer,
+            part_style: None,
+            sung: false,
             voice: HumanVoice::new(efs, singer.body, oversample_for(efs)),
             space: VowelSpace::new(singer.mix),
             eco,
@@ -285,6 +323,14 @@ impl Slot {
         }
     }
 
+    fn schedule_syllable(&mut self, plan: &SungSyllable, key: f64, release: bool) {
+        let gestures = if release { &plan.release } else { &plan.attack };
+        let now = self.voice.clock;
+        for &gesture in gestures {
+            self.voice.score.add(lyrics::shifted(gesture, now, key));
+        }
+    }
+
     fn release(&mut self) {
         self.held = false;
         self.note_id = -1;
@@ -322,7 +368,7 @@ impl Slot {
         let sounding = self.held && self.wait < 0;
 
         // ---- control ----
-        let s = &c.style;
+        let s = self.part_style.as_ref().unwrap_or(&c.style);
         let sg = self.singer;
         self.t += c.dt;
         // deriva lenta de afinación: paseo al azar que vuelve al centro
@@ -359,7 +405,7 @@ impl Slot {
             self.sway -= 1.0;
         }
         let gate = 1.0 + 0.10 * c.humanize * (std::f64::consts::TAU * self.sway).sin();
-        self.voice.set_gate(if sounding { gate } else { 0.0 });
+        self.voice.set_gate(if sounding && !self.sung { gate } else { 0.0 });
 
         // ---- audio ----
         if self.eco {
@@ -492,6 +538,10 @@ pub struct Choir {
     /// teclas apretadas (Tutti y Solo): id, tecla, velocidad
     stack: [(i32, u8, f64); STACK],
     stack_len: usize,
+    part_keys: [[(i32, u8, f64, Option<usize>); STACK]; PART_COUNT],
+    lyrics: Lyrics,
+    cursors: [usize; PART_COUNT],
+    part_len: [usize; PART_COUNT],
     bend: f64,
     vowel_phase: f64,
     active: [usize; MAX_SINGERS],
@@ -534,6 +584,10 @@ impl Choir {
             rr: 0,
             stack: [(0, 0, 0.0); STACK],
             stack_len: 0,
+            part_keys: [[(0, 0, 0.0, None); STACK]; PART_COUNT],
+            lyrics: Lyrics::default(),
+            cursors: [0; PART_COUNT],
+            part_len: [0; PART_COUNT],
             bend: 0.0,
             vowel_phase: 0.0,
             active: [0; MAX_SINGERS],
@@ -606,6 +660,7 @@ impl Choir {
         let rebuild = p.structural() != self.params.structural();
         let faces = p.custom != self.params.custom;
         let mode_changed = p.mode != self.params.mode;
+        let previous_parts = self.params.parts;
         self.params = p;
         self.room.set_kind(p.room);
         if rebuild {
@@ -615,17 +670,26 @@ impl Choir {
         } else if mode_changed {
             self.all_notes_off();
         }
+        if mode_changed || rebuild || faces || p.parts != previous_parts {
+            for i in 0..self.count {
+                if let Some(slot) = self.slot(i).as_mut() {
+                    slot.part_style = (p.mode == Mode::Partes).then(|| p.parts[i].style.def());
+                }
+            }
+        }
     }
 
     fn rebuild(&mut self) {
         let p = self.params;
-        let n = p.singers.clamp(1, MAX_SINGERS);
+        let (_, n) = p.elenco();
         for i in 0..MAX_SINGERS {
             let slot = if i < n { Some(Slot::new(self.fs, p.singer(i), p.quality)) } else { None };
             *lock(&self.shared.slots[i]) = slot;
         }
         self.count = n;
         self.stack_len = 0;
+        self.part_len.fill(0);
+        self.cursors.fill(0);
         self.rr = 0;
         self.n_active = 0;
         self.levels = [0.0; MAX_SINGERS];
@@ -666,6 +730,7 @@ impl Choir {
         let id = id.max(0);
         match self.params.mode {
             Mode::Coro => self.note_on_choir(id, key, velocity),
+            Mode::Partes => self.part_on(id, key, velocity),
             Mode::Tutti | Mode::Solo => {
                 self.stack_remove(id);
                 if self.stack_len == STACK {
@@ -682,6 +747,7 @@ impl Choir {
     pub fn note_off(&mut self, id: i32) {
         let id = id.max(0);
         match self.params.mode {
+            Mode::Partes => self.part_off(id),
             Mode::Coro => {
                 for i in 0..self.count {
                     if let Some(s) = self.slot(i).as_mut() {
@@ -700,12 +766,136 @@ impl Choir {
 
     pub fn all_notes_off(&mut self) {
         self.stack_len = 0;
+        self.part_len.fill(0);
         for i in 0..self.count {
             if let Some(s) = self.slot(i).as_mut() {
                 if s.held {
                     s.release();
                 }
+                if s.sung {
+                    s.voice.cancel_score();
+                    s.sung = false;
+                }
             }
+        }
+    }
+
+    /// Soporta el teclado físico y las notas de pantalla en un espacio separado.
+    fn part_index(id: i32) -> Option<usize> {
+        let channel = (id / 128) as usize;
+        match channel {
+            0..PART_COUNT => Some(channel),
+            16..20 => Some(channel - 16),
+            _ => None,
+        }
+    }
+
+    fn part_on(&mut self, id: i32, key: u8, velocity: f64) {
+        let Some(i) = Self::part_index(id) else { return };
+        let p = self.params.parts[i];
+        if !(p.low..=p.high).contains(&key) {
+            return;
+        }
+        let repeated = self.part_keys[i][..self.part_len[i]].iter().find(|entry| entry.0 == id).map(|entry| entry.3);
+        let syllable = repeated.unwrap_or_else(|| {
+            let cursor = &mut self.cursors[i];
+            if *cursor >= self.lyrics.lines[i].len() {
+                return None;
+            }
+            let current = *cursor;
+            *cursor += 1;
+            Some(current)
+        });
+        self.remove_part_key(i, id);
+        let len = &mut self.part_len[i];
+        let keys = &mut self.part_keys[i];
+        if *len == STACK {
+            keys.copy_within(1.., 0);
+            *len -= 1;
+        }
+        keys[*len] = (id, key, velocity, syllable);
+        *len += 1;
+        self.sing_part(i);
+    }
+
+    fn remove_part_key(&mut self, i: usize, id: i32) {
+        let len = &mut self.part_len[i];
+        let keys = &mut self.part_keys[i];
+        if let Some(j) = keys[..*len].iter().position(|entry| entry.0 == id) {
+            keys.copy_within(j + 1..*len, j);
+            *len -= 1;
+        }
+    }
+
+    fn part_off(&mut self, id: i32) {
+        let Some(i) = Self::part_index(id) else { return };
+        let len = self.part_len[i];
+        let was_top = len > 0 && self.part_keys[i][len - 1].0 == id;
+        let previous = was_top.then(|| self.part_keys[i][len - 1].3).flatten();
+        self.remove_part_key(i, id);
+        if was_top {
+            if let Some(slot) = self.slot(i).as_mut() {
+                if slot.sung {
+                    slot.voice.release(1.0);
+                    slot.voice.release(2.0);
+                    if let Some(syllable) = previous.and_then(|j| self.lyrics.lines[i].get(j)) {
+                        slot.schedule_syllable(syllable, slot.key, true);
+                    }
+                }
+            }
+            self.sing_part(i);
+        }
+    }
+
+    fn sing_part(&mut self, i: usize) {
+        let top = self.part_len[i].checked_sub(1).map(|j| self.part_keys[i][j]);
+        self.order += 1;
+        if let Some(slot) = self.slot(i).as_mut() {
+            match top {
+                Some((id, key, velocity, syllable)) => {
+                    let plan = syllable.and_then(|j| self.lyrics.lines[i].get(j));
+                    if plan.is_some_and(|p| p.continuation) && slot.sung && slot.held {
+                        let now = slot.voice.clock;
+                        slot.voice.release(2.0);
+                        for &gesture in &plan.unwrap().attack {
+                            if gesture.tag == Some(2.0) {
+                                let mut next = lyrics::shifted(gesture, now, f64::from(key));
+                                let length = next.t1 - next.t0;
+                                next.t0 = now;
+                                next.t1 = now + length;
+                                slot.voice.score.add(next);
+                            }
+                        }
+                        slot.start(id, f64::from(key), velocity, 0, self.order);
+                        return;
+                    }
+                    slot.voice.cancel_score();
+                    slot.sung = syllable.is_some();
+                    slot.start(id, f64::from(key), velocity, 0, self.order);
+                    if let Some(plan) = plan {
+                        slot.schedule_syllable(plan, f64::from(key), false);
+                    }
+                }
+                None => slot.release(),
+            }
+        }
+    }
+
+    /// Devuelve el banco anterior al productor externo para liberarlo allí.
+    pub fn replace_lyrics(&mut self, lyrics: Lyrics) -> Lyrics {
+        self.reset_lyrics();
+        std::mem::replace(&mut self.lyrics, lyrics)
+    }
+
+    pub fn reset_lyrics(&mut self) {
+        self.cursors.fill(0);
+        for i in 0..PART_COUNT {
+            for key in &mut self.part_keys[i][..self.part_len[i]] {
+                key.3 = None;
+            }
+        }
+        if self.params.mode == Mode::Partes {
+            self.all_notes_off();
         }
     }
 
@@ -816,7 +1006,7 @@ impl Choir {
 
     fn for_note(&mut self, id: i32, f: impl Fn(&mut Slot)) {
         let id = id.max(0);
-        let mono = self.params.mode != Mode::Coro;
+        let mono = matches!(self.params.mode, Mode::Solo | Mode::Tutti);
         for i in 0..self.count {
             if let Some(s) = self.slot(i).as_mut() {
                 if s.held && (s.note_id == id || (mono && s.note_id == TOP_ID)) {
@@ -905,7 +1095,13 @@ impl Choir {
         }
 
         // ---- calcularlas: una sola vez por bloque se despierta a los ayudantes ----
-        if k > 0 {
+        if k > 0 && (self.workers.is_empty() || k == 1) {
+            for &idx in &self.active[..k] {
+                if let Some(slot) = lock(&self.shared.slots[idx]).as_mut() {
+                    slot.render_block(&ctls[..nc]);
+                }
+            }
+        } else if k > 0 {
             let sh = &self.shared;
             *lock(&sh.ctl) = (ctls, nc);
             *lock(&sh.list) = self.active;
@@ -913,23 +1109,19 @@ impl Choir {
             sh.next.store(0, Ordering::Release);
             sh.total.store(k, Ordering::Release);
             let helpers = self.workers.len();
-            if helpers > 0 && k > 1 {
-                sh.busy.store(helpers, Ordering::Release);
-                lock(&sh.job).gen += 1;
-                sh.cv.notify_all();
-                sh.work();
-                // este hilo también trabajó; espera a que los ayudantes suelten lo suyo
-                let mut spins = 0u32;
-                while sh.done.load(Ordering::Acquire) < k || sh.busy.load(Ordering::Acquire) > 0 {
-                    spins += 1;
-                    if spins < 2000 {
-                        std::hint::spin_loop();
-                    } else {
-                        std::thread::yield_now();
-                    }
+            sh.busy.store(helpers, Ordering::Release);
+            lock(&sh.job).gen += 1;
+            sh.cv.notify_all();
+            sh.work();
+            // este hilo también trabajó; espera a que los ayudantes suelten lo suyo
+            let mut spins = 0u32;
+            while sh.done.load(Ordering::Acquire) < k || sh.busy.load(Ordering::Acquire) > 0 {
+                spins += 1;
+                if spins < 2000 {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
                 }
-            } else {
-                sh.work();
             }
             sh.total.store(0, Ordering::Release);
         }
@@ -963,8 +1155,7 @@ impl Choir {
         let width = p.width.clamp(0.0, 1.0) * (1.0 - 0.45 * mic);
         for a in 0..listed {
             let idx = self.active[a];
-            let shared = self.shared.clone();
-            let mut g = lock(&shared.slots[idx]);
+            let mut g = lock(&self.shared.slots[idx]);
             let Some(s) = g.as_mut() else { continue };
             if !s.wanted[c] {
                 continue;
@@ -981,8 +1172,10 @@ impl Choir {
             let pan = (s.singer.pan * width).clamp(-1.0, 1.0);
             let ang = (pan + 1.0) * std::f64::consts::FRAC_PI_4;
             let direct = 1.0 / (1.0 + 1.2 * dist);
-            let gl = (ang.cos() * direct * std::f64::consts::SQRT_2) as f32;
-            let gr = (ang.sin() * direct * std::f64::consts::SQRT_2) as f32;
+            let cos = ang.cos();
+            let sin = ang.sin();
+            let gl = (cos * direct * std::f64::consts::SQRT_2) as f32;
+            let gr = (sin * direct * std::f64::consts::SQRT_2) as f32;
             let send = (0.25 + 0.9 * dist) as f32;
             // lejos se pierden agudos
             let lp = (1.0 - 0.55 * dist) as f32;
@@ -991,8 +1184,8 @@ impl Choir {
                 z += lp * (s.out[base + i] - z);
                 dry_l[i] += z * gl;
                 dry_r[i] += z * gr;
-                snd_l[i] += z * send * (ang.cos() as f32);
-                snd_r[i] += z * send * (ang.sin() as f32);
+                snd_l[i] += z * send * (cos as f32);
+                snd_r[i] += z * send * (sin as f32);
             }
             s.dist_lp = if z.abs() < 1e-20 { 0.0 } else { z };
         }
@@ -1033,6 +1226,29 @@ impl Drop for Choir {
 #[cfg(test)]
 mod phrasing_tests {
     use super::*;
+
+    #[test]
+    fn partes_admiten_unisono_y_letra_independiente() {
+        let mut c = Choir::new(48_000.0, 1);
+        let params = ChoirParams { mode: Mode::Partes, ..ChoirParams::DEFAULT };
+        c.set_params(params);
+        let lines = ["sol", "pan", "luz", "mar"].map(str::to_owned);
+        c.replace_lyrics(Lyrics::prepare(&lines, &params).unwrap());
+        c.note_on(59, 59, 0.7);
+        assert_eq!(c.cursors[0], 0);
+        c.note_on(60, 60, 0.7);
+        c.note_on(128 + 60, 60, 0.7);
+        assert_eq!(c.cursors, [1, 1, 0, 0]);
+        assert!(c.slot(0).as_ref().unwrap().sung);
+        assert!(c.slot(1).as_ref().unwrap().sung);
+        c.note_on(60, 60, 0.7);
+        assert_eq!(c.cursors, [1, 1, 0, 0]);
+        c.note_off(60);
+        assert!(!c.slot(0).as_ref().unwrap().held);
+        assert!(c.slot(1).as_ref().unwrap().held);
+        c.all_notes_off();
+        assert!(c.part_len.iter().all(|n| *n == 0));
+    }
 
     #[test]
     fn cuarteto_conserva_tono_comun_y_prefiere_el_movimiento_corto() {
