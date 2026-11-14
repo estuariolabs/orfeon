@@ -49,6 +49,8 @@ enum Msg {
     AllOff,
     Params(ChoirParams),
     Threads(usize),
+    Lyrics(orfeon_core::lyrics::Lyrics),
+    ResetLyrics,
 }
 
 /// Medidores compartidos entre los hilos.
@@ -147,6 +149,8 @@ fn producer(mut choir: Choir, rx: Receiver<Msg>, mut out: rtrb::Producer<f32>, s
                 }
                 Msg::Params(p) => choir.set_params(p),
                 Msg::Threads(n) => choir.set_threads(n),
+                Msg::Lyrics(bank) => { choir.replace_lyrics(bank); }
+                Msg::ResetLyrics => choir.reset_lyrics(),
             }
         }
         let queued = (cap - out.slots()) / 2;
@@ -271,17 +275,57 @@ fn midi_connect(index: usize, tx: Sender<Msg>, producer: std::thread::Thread) ->
     let ports = input.ports();
     let port = ports.get(index).ok_or_else(|| format!("no hay una entrada MIDI {}", index + 1))?;
     let name = input.port_name(port).unwrap_or_else(|_| "(sin nombre)".into());
+    let monitor = if std::env::var_os("ORFEON_MONITOR_MIDI").is_some() {
+        let (log, records) = std::sync::mpsc::sync_channel::<(u64, [u8; 3], usize, u64)>(4096);
+        let port_name = name.clone();
+        std::thread::Builder::new().name("orfeon-midi-monitor".into()).spawn(move || {
+            eprintln!("MIDI monitor: {port_name}");
+            let mut notes = [[false; 128]; 16];
+            for (stamp, bytes, len, dropped) in records {
+                if dropped > 0 {
+                    eprintln!("MIDI monitor: {dropped} registros omitidos; contador parcial hasta el próximo CC 120/123");
+                }
+                let [status, note, velocity] = bytes;
+                if len == 3 && note < 128 {
+                    match status & 0xF0 {
+                        0x80 | 0x90 => {
+                            notes[(status & 15) as usize][note as usize] =
+                                status & 0xF0 == 0x90 && velocity > 0;
+                        }
+                        0xB0 if note == 120 || note == 123 => notes = [[false; 128]; 16],
+                        _ => {}
+                    }
+                }
+                let held = notes.iter().flatten().filter(|&&held| held).count();
+                eprintln!("MIDI {stamp:>12} μs {:02X?}  notas recibidas sostenidas: {held}", &bytes[..len]);
+            }
+        }).map_err(|e| e.to_string())?;
+        Some(log)
+    } else {
+        None
+    };
+    let mut lost_records = 0u64;
     let conn = input
         .connect(
             port,
             "orfeon-entrada",
-            move |_stamp, msg, _| {
-                if msg.len() < 2 {
+            move |stamp, msg, _| {
+                if let Some(log) = &monitor {
+                    let mut bytes = [0; 3];
+                    let len = msg.len().min(bytes.len());
+                    bytes[..len].copy_from_slice(&msg[..len]);
+                    if log.try_send((stamp, bytes, len, lost_records)).is_ok() {
+                        lost_records = 0;
+                    } else {
+                        lost_records += 1;
+                    }
+                }
+                if msg.len() < 3 {
                     return;
                 }
                 let (status, ch) = (msg[0] & 0xF0, (msg[0] & 0x0F) as i32);
                 let d1 = msg[1] & 0x7F;
-                let d2 = msg.get(2).copied().unwrap_or(0) & 0x7F;
+                let d2 = msg[2] & 0x7F;
                 let id = ch * 128 + d1 as i32;
                 let m = match status {
                     0x90 if d2 > 0 => Some(Msg::On(id, d1, d2 as f64 / 127.0)),
@@ -440,6 +484,59 @@ fn stop(r: Running) {
 /// id de las notas del teclado de pantalla: el "canal 16" (así id % 128 = nota).
 const SCREEN_ID: i32 = 16 * 128;
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct QuartetProject {
+    version: u8,
+    parts: [(u8, u8, usize); 4],
+    words: [String; 4],
+    lyrics: [String; 4],
+}
+
+impl QuartetProject {
+    fn path() -> std::io::Result<std::path::PathBuf> {
+        let root = std::env::var_os("ORFEON_PROJECT");
+        if let Some(path) = root { return Ok(path.into()); }
+        Ok(std::env::current_dir()?.join("Orfeon-Cuarteto.json"))
+    }
+
+    fn save(model: &orfeon_ui::Model) -> Result<String, Box<dyn std::error::Error>> {
+        let path = Self::path()?;
+        let project = Self {
+            version: 1,
+            parts: model.params.parts.map(|p| (p.low, p.high, p.style.index())),
+            words: model.words.clone(),
+            lyrics: model.lyrics.clone(),
+        };
+        orfeon_core::lyrics::Lyrics::prepare(&project.lyrics, &model.params)?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&project)?)?;
+        std::fs::rename(tmp, &path)?;
+        Ok(format!("Cuarteto guardado en {}", path.display()))
+    }
+
+    fn load(model: &mut orfeon_ui::Model) -> Result<orfeon_core::lyrics::Lyrics, Box<dyn std::error::Error>> {
+        let path = Self::path()?;
+        let file = std::fs::File::open(&path)?;
+        if file.metadata()?.len() > 64 * 1024 {
+            return Err("El archivo del cuarteto supera 64 KiB.".into());
+        }
+        let project: Self = serde_json::from_reader(file)?;
+        if project.version != 1 || project.parts.iter().any(|&(lo, hi, style)| lo > hi || hi > 127 || style >= orfeon_core::Style::ALL.len()) {
+            return Err("Formato de cuarteto inválido.".into());
+        }
+        let mut params = model.params;
+        params.mode = Mode::Partes;
+        params.parts = project.parts.map(|(low, high, style)| orfeon_core::Part { low, high, style: orfeon_core::Style::from_index(style) });
+        let bank = orfeon_core::lyrics::Lyrics::prepare(&project.lyrics, &params)?;
+        model.params = params;
+        model.words = project.words;
+        model.lyrics = project.lyrics;
+        model.preset = None;
+        model.lyrics_status = format!("Cuarteto abierto desde {}", path.display());
+        Ok(bank)
+    }
+}
+
 struct Gui {
     model: orfeon_ui::Model,
     tx: Sender<Msg>,
@@ -478,9 +575,29 @@ impl Gui {
         }
         for e in events.drain(..) {
             match e {
-                orfeon_ui::Event::NoteOn(k, v) => self.send(Msg::On(SCREEN_ID + k as i32, k, v as f64)),
-                orfeon_ui::Event::NoteOff(k) => self.send(Msg::Off(SCREEN_ID + k as i32)),
+                orfeon_ui::Event::NoteOn(k, v, part) => self.send(Msg::On(SCREEN_ID + part as i32 * 128 + k as i32, k, v as f64)),
+                orfeon_ui::Event::NoteOff(k, part) => self.send(Msg::Off(SCREEN_ID + part as i32 * 128 + k as i32)),
                 orfeon_ui::Event::AllOff => self.send(Msg::AllOff),
+                orfeon_ui::Event::ResetLyrics => self.send(Msg::ResetLyrics),
+                orfeon_ui::Event::SaveQuartet => {
+                    self.model.lyrics_status = QuartetProject::save(&self.model).unwrap_or_else(|error| error.to_string());
+                }
+                orfeon_ui::Event::OpenQuartet => match QuartetProject::load(&mut self.model) {
+                    Ok(bank) => {
+                        self.send(Msg::Params(self.model.params));
+                        self.send(Msg::Lyrics(bank));
+                    }
+                    Err(error) => self.model.lyrics_status = error.to_string(),
+                },
+                orfeon_ui::Event::ApplyLyrics => {
+                    self.model.lyrics_status = match orfeon_core::lyrics::Lyrics::prepare(&self.model.lyrics, &self.model.params) {
+                        Ok(bank) => {
+                            self.send(Msg::Lyrics(bank));
+                            "Letras aplicadas. Los cursores empiezan desde el inicio.".into()
+                        }
+                        Err(error) => error,
+                    };
+                }
                 orfeon_ui::Event::Threads(n) => {
                     self.meters.threads.store(n, Ordering::Relaxed);
                     self.send(Msg::Threads(n));

@@ -25,6 +25,7 @@ fn usage() -> ! {
          orfeon presets                          lista los programas\n  \
          orfeon singers [opciones]               muestra los cantantes del coro\n  \
          orfeon render SALIDA.wav [opciones]     rinde una demo o una partitura\n  \
+         orfeon cuarteto PREFIJO [opciones]   genera demo con letra y cuatro pistas\n  \
          orfeon bench [opciones]                 mide la carga por cantidad de voces\n\n\
          opciones:\n  \
          --preset N|NOMBRE    programa de fábrica (número desde 1, o nombre)\n  \
@@ -32,6 +33,7 @@ fn usage() -> ! {
          --score ARCHIVO      partitura de texto: una nota por línea, \"inicio duración nota [velocidad]\"\n  \
          --mode coro|tutti|solo   --singers N   --style 1..8   --room 1..5\n  \
          --vowel a|e|i|o|u    --voices N (tope simultáneo)   --eco (calidad económica)\n  \
+         --sin-fraseo         desactiva conducción y escalonado para comparar\n  \
          --threads N          hilos de cálculo (por defecto: los de la máquina)\n  \
          --tail SEG           segundos de cola al final (por defecto 3)"
     );
@@ -128,6 +130,10 @@ fn parse(args: &[String]) -> Opts {
                 o.params.vowel_x = x;
                 o.params.vowel_y = y;
                 i += 1;
+            }
+            "--sin-fraseo" => {
+                o.params.voice_leading = false;
+                o.params.stagger_ms = 0.0;
             }
             "--eco" => o.params.quality = Quality::Eco,
             "--threads" => {
@@ -309,9 +315,60 @@ fn main() {
             }
             println!("{out}: {dur:.1} s de audio en {secs:.1} s ({:.0} % de tiempo real, {} hilos), hasta {peak} voces, rms {rms:.3}, pico {pk:.2}", 100.0 * secs / dur, o.threads);
         }
+        "cuarteto" => {
+            let Some(out) = o.out else { usage() };
+            let params = ChoirParams { mode: Mode::Partes, ..o.params };
+            let words = ["Canta la luna", "Late la tierra", "Sopla la brisa", "Suena la mar"];
+            let mut text = words.map(orfeon_core::lyrics::spanish_ipa);
+            text[0] = text[0].replacen('.', ".-.", 1);
+            let notes = [[64, 72, 71, 69, 72], [48, 52, 53, 55, 48], [64, 64, 65, 67, 64], [55, 57, 57, 59, 55]];
+            let block = 128;
+            let steps = 6;
+            let blocks_per_step = 1750;
+            let render_quartet = |stem: Option<usize>| {
+                let mut choir = Choir::new(FS, o.threads);
+                choir.set_params(params);
+                choir.replace_lyrics(orfeon_core::lyrics::Lyrics::prepare(&text, &params).expect("letra de la demo"));
+                let len = (steps * blocks_per_step + 750) * block;
+                let (mut left, mut right) = (vec![0.0; len], vec![0.0; len]);
+                let mut timings = Vec::new();
+                for (b, (l, r)) in left.chunks_mut(block).zip(right.chunks_mut(block)).enumerate() {
+                    let step = b / blocks_per_step;
+                    let phase = b % blocks_per_step;
+                    for (part, line) in notes.iter().enumerate() {
+                        if step >= steps || stem.is_some_and(|i| i != part) { continue; }
+                        let key = line[step % line.len()];
+                        let id = part as i32 * 128 + i32::from(key);
+                        if phase == 18 + part * 23 {
+                            if part == 0 && step == 1 {
+                                choir.note_on(id, key, 0.7);
+                                choir.note_off(i32::from(line[0]));
+                                continue;
+                            }
+                            choir.note_on(id, key, 0.7);
+                        }
+                        if phase == 1350 + part * 23 && !(part == 0 && step == 0) {
+                            choir.note_off(id);
+                        }
+                    }
+                    let t = Instant::now();
+                    choir.render(l, r);
+                    timings.push(t.elapsed());
+                }
+                timings.sort_unstable();
+                if stem.is_none() {
+                    println!("Cuarteto con letra: p99 {:.3} ms por bloque de 128", timings[(timings.len() * 99).div_ceil(100) - 1].as_secs_f64() * 1000.0);
+                }
+                (left, right)
+            };
+            for (stem, suffix) in [(None, ""), (Some(0), "-soprano"), (Some(1), "-bajo"), (Some(2), "-contralto"), (Some(3), "-tenor")] {
+                let (l, r) = render_quartet(stem);
+                write_wav(&format!("{out}{suffix}.wav"), &l, &r).expect("WAV del cuarteto");
+            }
+        }
         "bench" => {
             println!("programa: {}  calidad: {:?}  hilos: {}", o.preset_name, o.params.quality, o.threads);
-            println!("voces  carga (100 % = tiempo real)");
+            println!("voces  carga media      p50      p99      máx. (ms/bloque de 128)");
             for voices in [1usize, 2, 4, 8, 16, 32, 64] {
                 let mut p = o.params;
                 p.mode = Mode::Coro;
@@ -325,12 +382,24 @@ fn main() {
                 let secs = 2.0;
                 let mut l = vec![0f32; 128];
                 let mut r = vec![0f32; 128];
-                let t0 = Instant::now();
-                for _ in 0..(secs * FS / 128.0) as usize {
+                let blocks = (secs * FS / 128.0) as usize;
+                let mut timings = Vec::with_capacity(blocks);
+                for _ in 0..32 {
                     choir.render(&mut l, &mut r);
                 }
-                let load = 100.0 * t0.elapsed().as_secs_f64() / secs;
-                println!("{voices:5}  {load:6.0} %{}", if load < 70.0 { "" } else if load < 100.0 { "   (justo)" } else { "   (no llega en tiempo real)" });
+                for _ in 0..blocks {
+                    let start = Instant::now();
+                    choir.render(&mut l, &mut r);
+                    timings.push(start.elapsed().as_secs_f64());
+                }
+                let load = 100.0 * timings.iter().sum::<f64>() / secs;
+                timings.sort_unstable_by(f64::total_cmp);
+                println!(
+                    "{voices:5}  {load:9.1} %  {:7.3}  {:7.3}  {:7.3}",
+                    timings[blocks / 2] * 1000.0,
+                    timings[(blocks * 99).div_ceil(100) - 1] * 1000.0,
+                    timings[blocks - 1] * 1000.0,
+                );
                 if load > 400.0 {
                     break;
                 }

@@ -33,7 +33,7 @@ pub enum Command {
 
 pub const HELP: &str = "\
 comandos (Enter para enviar):
-  programas            lista los 36 programas
+  programas            lista los programas
   p N | p NOMBRE       elige un programa (p 7, p catedral)
   n 60 64 67 [SEG]     toca esas notas MIDI juntas (2 s si no se indica)
   demo                 toca una cadencia de acordes

@@ -21,6 +21,7 @@ enum ModeP {
     Tutti,
     #[name = "Solo (un cantante, ligado)"]
     Solo,
+    Partes,
 }
 
 #[derive(Enum, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +78,10 @@ struct OrfeonParams {
     /// último programa elegido (sólo para mostrar su nombre)
     #[persist = "programa"]
     preset: RwLock<Option<usize>>,
+    #[persist = "part_ipa_v1"]
+    lyrics: RwLock<[String; 4]>,
+    #[persist = "part_words_v1"]
+    words: RwLock<[String; 4]>,
     #[id = "mode"]
     mode: EnumParam<ModeP>,
     #[id = "singers"]
@@ -137,6 +142,34 @@ struct OrfeonParams {
     quality: EnumParam<QualityP>,
     #[id = "threads"]
     threads: IntParam,
+    #[id = "voiceld"]
+    voice_leading: BoolParam,
+    #[id = "stagger"]
+    stagger_ms: FloatParam,
+    #[id = "part0_low"]
+    part0_low: IntParam,
+    #[id = "part0_high"]
+    part0_high: IntParam,
+    #[id = "part0_style"]
+    part0_style: EnumParam<StyleP>,
+    #[id = "part1_low"]
+    part1_low: IntParam,
+    #[id = "part1_high"]
+    part1_high: IntParam,
+    #[id = "part1_style"]
+    part1_style: EnumParam<StyleP>,
+    #[id = "part2_low"]
+    part2_low: IntParam,
+    #[id = "part2_high"]
+    part2_high: IntParam,
+    #[id = "part2_style"]
+    part2_style: EnumParam<StyleP>,
+    #[id = "part3_low"]
+    part3_low: IntParam,
+    #[id = "part3_high"]
+    part3_high: IntParam,
+    #[id = "part3_style"]
+    part3_style: EnumParam<StyleP>,
 }
 
 fn unit(name: &str, default: f32) -> FloatParam {
@@ -154,6 +187,8 @@ impl Default for OrfeonParams {
             editor_state: EguiState::from_size(orfeon_ui::WIDTH, orfeon_ui::HEIGHT),
             custom: RwLock::new(vec![None; MAX_SINGERS]),
             preset: RwLock::new(Some(0)),
+            lyrics: RwLock::default(),
+            words: RwLock::default(),
             mode: EnumParam::new("Modo", ModeP::Coro),
             singers: IntParam::new("Cantantes", d.singers as i32, IntRange::Linear { min: 1, max: 64 }),
             ensemble: EnumParam::new("Conjunto", EnsembleP::Mixto),
@@ -183,6 +218,20 @@ impl Default for OrfeonParams {
             gain: FloatParam::new("Volumen", 0.0, FloatRange::Linear { min: -36.0, max: 12.0 }).with_unit(" dB").with_value_to_string(formatters::v2s_f32_rounded(1)),
             max_voices: IntParam::new("Voces a la vez (tope)", d.max_voices as i32, IntRange::Linear { min: 1, max: 64 }),
             quality: EnumParam::new("Calidad", QualityP::Alta),
+            voice_leading: BoolParam::new("Conducción vocal", d.voice_leading),
+            stagger_ms: FloatParam::new("Entradas de grave a agudo", d.stagger_ms as f32, FloatRange::Linear { min: 0.0, max: 40.0 }).with_unit(" ms"),
+            part0_low: IntParam::new("Parte 1: Grave", d.parts[0].low as i32, IntRange::Linear { min: 0, max: 127 }),
+            part0_high: IntParam::new("Parte 1: Aguda", d.parts[0].high as i32, IntRange::Linear { min: 0, max: 127 }),
+            part0_style: EnumParam::new("Parte 1: Estilo", StyleP::from_index(d.parts[0].style.index())),
+            part1_low: IntParam::new("Parte 2: Grave", d.parts[1].low as i32, IntRange::Linear { min: 0, max: 127 }),
+            part1_high: IntParam::new("Parte 2: Aguda", d.parts[1].high as i32, IntRange::Linear { min: 0, max: 127 }),
+            part1_style: EnumParam::new("Parte 2: Estilo", StyleP::from_index(d.parts[1].style.index())),
+            part2_low: IntParam::new("Parte 3: Grave", d.parts[2].low as i32, IntRange::Linear { min: 0, max: 127 }),
+            part2_high: IntParam::new("Parte 3: Aguda", d.parts[2].high as i32, IntRange::Linear { min: 0, max: 127 }),
+            part2_style: EnumParam::new("Parte 3: Estilo", StyleP::from_index(d.parts[2].style.index())),
+            part3_low: IntParam::new("Parte 4: Grave", d.parts[3].low as i32, IntRange::Linear { min: 0, max: 127 }),
+            part3_high: IntParam::new("Parte 4: Aguda", d.parts[3].high as i32, IntRange::Linear { min: 0, max: 127 }),
+            part3_style: EnumParam::new("Parte 4: Estilo", StyleP::from_index(d.parts[3].style.index())),
             threads: IntParam::new("Hilos", cores.clamp(1, 16), IntRange::Linear { min: 1, max: 16 }),
         }
     }
@@ -205,6 +254,8 @@ impl OrfeonParams {
                 vowel_rate: self.vowel_rate.value() as f64,
                 vowel_spread: self.vowel_spread.value() as f64,
                 humanize: self.humanize.value() as f64,
+                voice_leading: self.voice_leading.value(),
+                stagger_ms: self.stagger_ms.value() as f64,
                 vibrato: self.vibrato.value() as f64,
                 breath: self.breath.value() as f64,
                 brightness: self.brightness.value() as f64,
@@ -218,6 +269,18 @@ impl OrfeonParams {
                 ..ChoirParams::DEFAULT
             }
         };
+        p.parts[0].low = self.part0_low.value() as u8;
+        p.parts[0].high = self.part0_high.value() as u8;
+        p.parts[0].style = orfeon_core::Style::from_index(self.part0_style.value() as usize);
+        p.parts[1].low = self.part1_low.value() as u8;
+        p.parts[1].high = self.part1_high.value() as u8;
+        p.parts[1].style = orfeon_core::Style::from_index(self.part1_style.value() as usize);
+        p.parts[2].low = self.part2_low.value() as u8;
+        p.parts[2].high = self.part2_high.value() as u8;
+        p.parts[2].style = orfeon_core::Style::from_index(self.part2_style.value() as usize);
+        p.parts[3].low = self.part3_low.value() as u8;
+        p.parts[3].high = self.part3_high.value() as u8;
+        p.parts[3].style = orfeon_core::Style::from_index(self.part3_style.value() as usize);
         p.gain_db = self.gain.value() as f64;
         p.max_voices = self.max_voices.value().clamp(1, 64) as usize;
         p.quality = if self.quality.value() == QualityP::Eco { orfeon_core::Quality::Eco } else { orfeon_core::Quality::Alta };
@@ -270,6 +333,24 @@ impl OrfeonParams {
         f(setter, &self.vowel_rate, old.vowel_rate, new.vowel_rate);
         f(setter, &self.vowel_spread, old.vowel_spread, new.vowel_spread);
         f(setter, &self.humanize, old.humanize, new.humanize);
+        if old.voice_leading != new.voice_leading {
+            setter.begin_set_parameter(&self.voice_leading);
+            setter.set_parameter(&self.voice_leading, new.voice_leading);
+            setter.end_set_parameter(&self.voice_leading);
+        }
+        f(setter, &self.stagger_ms, old.stagger_ms, new.stagger_ms);
+        i(setter, &self.part0_low, old.parts[0].low as i32, new.parts[0].low as i32);
+        i(setter, &self.part0_high, old.parts[0].high as i32, new.parts[0].high as i32);
+        e(setter, &self.part0_style, old.parts[0].style.index(), new.parts[0].style.index());
+        i(setter, &self.part1_low, old.parts[1].low as i32, new.parts[1].low as i32);
+        i(setter, &self.part1_high, old.parts[1].high as i32, new.parts[1].high as i32);
+        e(setter, &self.part1_style, old.parts[1].style.index(), new.parts[1].style.index());
+        i(setter, &self.part2_low, old.parts[2].low as i32, new.parts[2].low as i32);
+        i(setter, &self.part2_high, old.parts[2].high as i32, new.parts[2].high as i32);
+        e(setter, &self.part2_style, old.parts[2].style.index(), new.parts[2].style.index());
+        i(setter, &self.part3_low, old.parts[3].low as i32, new.parts[3].low as i32);
+        i(setter, &self.part3_high, old.parts[3].high as i32, new.parts[3].high as i32);
+        e(setter, &self.part3_style, old.parts[3].style.index(), new.parts[3].style.index());
         f(setter, &self.vibrato, old.vibrato, new.vibrato);
         f(setter, &self.breath, old.breath, new.breath);
         f(setter, &self.brightness, old.brightness, new.brightness);
@@ -298,19 +379,27 @@ impl OrfeonParams {
 }
 
 /// Lo que comparten el hilo de audio y la interfaz.
+enum LyricsUpdate {
+    Apply(orfeon_core::lyrics::Lyrics),
+    Returned { _bank: orfeon_core::lyrics::Lyrics },
+    Reset,
+}
+
 struct Shared {
+    lyrics: Mutex<Option<LyricsUpdate>>,
     /// carga del cálculo en milésimas, voces sonando, nivel por cantante (bits de f32), notas
     load: AtomicU32,
     voices: AtomicUsize,
     levels: [AtomicU32; MAX_SINGERS],
     held: [AtomicBool; 128],
     /// notas del teclado de pantalla: (apretada, nota, velocidad). 255 = apagar todo.
-    screen: Mutex<Option<rtrb::Producer<(bool, u8, f32)>>>,
+    screen: Mutex<Option<rtrb::Producer<(bool, u8, f32, usize)>>>,
 }
 
 impl Default for Shared {
     fn default() -> Self {
         Shared {
+            lyrics: Mutex::new(None),
             load: AtomicU32::new(0),
             voices: AtomicUsize::new(0),
             levels: std::array::from_fn(|_| AtomicU32::new(0)),
@@ -334,7 +423,7 @@ struct Orfeon {
     applied: ChoirParams,
     threads: usize,
     shared: Arc<Shared>,
-    screen: Option<rtrb::Consumer<(bool, u8, f32)>>,
+    screen: Option<rtrb::Consumer<(bool, u8, f32, usize)>>,
     load: f64,
 }
 
@@ -384,7 +473,10 @@ impl Plugin for Orfeon {
         let params = self.params.clone();
         let start = params.choir(&ChoirParams::DEFAULT);
         let preset = params.preset.read().ok().and_then(|p| *p);
-        let state = EditorState { model: orfeon_ui::Model::new(start, preset), params: params.clone(), shared: self.shared.clone(), events: Vec::new() };
+        let mut model = orfeon_ui::Model::new(start, preset);
+        if let Ok(lyrics) = params.lyrics.read() { model.lyrics.clone_from(&lyrics); }
+        if let Ok(words) = params.words.read() { model.words.clone_from(&words); }
+        let state = EditorState { model, params: params.clone(), shared: self.shared.clone(), events: Vec::new() };
         create_egui_editor(
             params.editor_state.clone(),
             state,
@@ -413,16 +505,34 @@ impl Plugin for Orfeon {
                 }
                 for ev in events.drain(..) {
                     let msg = match ev {
-                        orfeon_ui::Event::NoteOn(k, v) => Some((true, k, v)),
-                        orfeon_ui::Event::NoteOff(k) => Some((false, k, 0.0)),
-                        orfeon_ui::Event::AllOff => Some((false, 255, 0.0)),
+                        orfeon_ui::Event::NoteOn(k, v, part) => Some((true, k, v, part)),
+                        orfeon_ui::Event::NoteOff(k, part) => Some((false, k, 0.0, part)),
+                        orfeon_ui::Event::AllOff => Some((false, 255, 0.0, 0)),
                         orfeon_ui::Event::Threads(n) => {
                             setter.begin_set_parameter(&st.params.threads);
                             setter.set_parameter(&st.params.threads, n as i32);
                             setter.end_set_parameter(&st.params.threads);
                             None
                         }
-                        orfeon_ui::Event::Latency(_) | orfeon_ui::Event::Midi(_) => None,
+                        orfeon_ui::Event::ApplyLyrics => {
+                            st.model.lyrics_status = match orfeon_core::lyrics::Lyrics::prepare(&st.model.lyrics, &st.model.params) {
+                                Ok(bank) => {
+                                    if let Ok(mut lyrics) = st.params.lyrics.write() { lyrics.clone_from(&st.model.lyrics); }
+                                    if let Ok(mut words) = st.params.words.write() { words.clone_from(&st.model.words); }
+                                    if let Ok(mut pending) = st.shared.lyrics.lock() { *pending = Some(LyricsUpdate::Apply(bank)); }
+                                    "Letras aplicadas. Los cursores empiezan desde el inicio.".into()
+                                }
+                                Err(error) => error,
+                            };
+                            None
+                        }
+                        orfeon_ui::Event::ResetLyrics => {
+                            if let Ok(mut pending) = st.shared.lyrics.lock() {
+                                if !matches!(*pending, Some(LyricsUpdate::Apply(_))) { *pending = Some(LyricsUpdate::Reset); }
+                            }
+                            None
+                        }
+                        orfeon_ui::Event::Latency(_) | orfeon_ui::Event::Midi(_) | orfeon_ui::Event::SaveQuartet | orfeon_ui::Event::OpenQuartet => None,
                     };
                     if let Some(m) = msg {
                         if let Ok(mut q) = st.shared.screen.lock() {
@@ -448,6 +558,11 @@ impl Plugin for Orfeon {
         }
         self.screen = Some(rx);
         choir.set_params(self.applied);
+        if let Ok(lyrics) = self.params.lyrics.read() {
+            if let Ok(bank) = orfeon_core::lyrics::Lyrics::prepare(&lyrics, &self.applied) {
+                choir.replace_lyrics(bank);
+            }
+        }
         self.choir = Some(choir);
         true
     }
@@ -465,17 +580,18 @@ impl Plugin for Orfeon {
         let t0 = Instant::now();
         // ---- teclado de pantalla ----
         if let Some(rx) = self.screen.as_mut() {
-            while let Ok((on, key, vel)) = rx.pop() {
+            while let Ok((on, key, vel, part)) = rx.pop() {
+                let id = SCREEN_ID + (part as i32) * 128 + key as i32;
                 if key == 255 {
                     choir.all_notes_off();
                     for h in self.shared.held.iter() {
                         h.store(false, Ordering::Relaxed);
                     }
                 } else if on {
-                    choir.note_on(SCREEN_ID + key as i32, key, vel as f64);
+                    choir.note_on(id, key, vel as f64);
                     self.shared.held[key as usize & 127].store(true, Ordering::Relaxed);
                 } else {
-                    choir.note_off(SCREEN_ID + key as i32);
+                    choir.note_off(id);
                     self.shared.held[key as usize & 127].store(false, Ordering::Relaxed);
                 }
             }
@@ -491,6 +607,14 @@ impl Plugin for Orfeon {
         if threads != self.threads {
             choir.set_threads(threads);
             self.threads = threads;
+        }
+
+        if let Ok(mut update) = self.shared.lyrics.try_lock() {
+            *update = match update.take() {
+                Some(LyricsUpdate::Apply(bank)) => Some(LyricsUpdate::Returned { _bank: choir.replace_lyrics(bank) }),
+                Some(LyricsUpdate::Reset) => { choir.reset_lyrics(); None }
+                other => other,
+            };
         }
 
         // ---- audio, cortando el bloque en cada evento ----
@@ -522,8 +646,13 @@ impl Plugin for Orfeon {
                             NoteEvent::PolyBrightness { channel, note, brightness, .. } => choir.note_brightness(note_id(channel, note), brightness as f64),
                             // rueda de afinación: ±2 semitonos
                             NoteEvent::MidiPitchBend { value, .. } => choir.set_pitch_bend((value as f64 - 0.5) * 4.0),
-                            // CC 123: todas las notas fuera
-                            NoteEvent::MidiCC { cc: 123, .. } => choir.all_notes_off(),
+                            // CC 120 / 123: mismo alcance global que en la app.
+                            NoteEvent::MidiCC { cc: 120 | 123, .. } => {
+                                choir.all_notes_off();
+                                for h in &self.shared.held {
+                                    h.store(false, Ordering::Relaxed);
+                                }
+                            }
                             _ => {}
                         }
                         next = context.next_event();

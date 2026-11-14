@@ -268,7 +268,7 @@ fn todos_los_programas_suenan() {
     let mut names: Vec<&str> = PRESETS.iter().map(|p| p.name).collect();
     names.sort();
     names.dedup();
-    assert_eq!(names.len(), 36, "hay programas con el mismo nombre o sin nombre");
+    assert_eq!(names.len(), PRESETS.len(), "hay programas con el mismo nombre o sin nombre");
     assert!(PRESETS.iter().all(|p| !p.name.is_empty()));
 }
 
@@ -348,4 +348,39 @@ fn editar_la_cara_de_un_cantante_no_corta_a_los_demas() {
     render(&mut c, 0.2);
     let lv = c.levels();
     assert!(lv.iter().filter(|x| **x > 1e-3).count() >= 2);
+}
+
+#[test]
+fn un_diff_perdido_deja_una_nota_hasta_el_panico() {
+    let mut choir = Choir::new(FS, 1);
+    choir.set_params(ChoirParams { mode: Mode::Coro, singers: 4, max_voices: 4, ..dry() });
+    choir.note_on(60, 60, 0.7);
+    choir.note_on(64, 64, 0.7);
+    // [60, 64] → [62, 64]: perdemos juntos Off(60) y On(62).
+    // [62, 64] → []: el emisor sólo apaga su propio acorde.
+    choir.note_off(62);
+    choir.note_off(64);
+    render(&mut choir, 1.0);
+    assert_eq!(choir.sounding(), 1);
+    choir.all_notes_off();
+    render(&mut choir, 1.0);
+    assert_eq!(choir.sounding(), 0);
+}
+
+#[test]
+fn un_ataque_repetido_conserva_el_cantante_y_las_otras_notas() {
+    let mut choir = Choir::new(FS, 1);
+    choir.set_params(ChoirParams { mode: Mode::Coro, singers: 4, max_voices: 3, ..dry() });
+    for key in [60, 64, 67] {
+        choir.note_on(key as i32, key, 0.7);
+    }
+    render(&mut choir, 0.5);
+    let occupied: Vec<_> = choir.levels().iter().map(|level| *level > 0.001).collect();
+    choir.note_on(64, 64, 0.9);
+    render(&mut choir, 0.5);
+    assert_eq!(choir.sounding(), 3);
+    assert!(choir.levels().iter().zip(occupied).all(|(level, was)| (*level > 0.001) == was));
+    choir.note_off(64);
+    render(&mut choir, 1.0);
+    assert_eq!(choir.sounding(), 2);
 }
