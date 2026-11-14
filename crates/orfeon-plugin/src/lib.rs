@@ -137,6 +137,10 @@ struct OrfeonParams {
     quality: EnumParam<QualityP>,
     #[id = "threads"]
     threads: IntParam,
+    #[id = "voiceld"]
+    voice_leading: BoolParam,
+    #[id = "stagger"]
+    stagger_ms: FloatParam,
 }
 
 fn unit(name: &str, default: f32) -> FloatParam {
@@ -183,6 +187,8 @@ impl Default for OrfeonParams {
             gain: FloatParam::new("Volumen", 0.0, FloatRange::Linear { min: -36.0, max: 12.0 }).with_unit(" dB").with_value_to_string(formatters::v2s_f32_rounded(1)),
             max_voices: IntParam::new("Voces a la vez (tope)", d.max_voices as i32, IntRange::Linear { min: 1, max: 64 }),
             quality: EnumParam::new("Calidad", QualityP::Alta),
+            voice_leading: BoolParam::new("Conducción vocal", d.voice_leading),
+            stagger_ms: FloatParam::new("Entradas de grave a agudo", d.stagger_ms as f32, FloatRange::Linear { min: 0.0, max: 40.0 }).with_unit(" ms"),
             threads: IntParam::new("Hilos", cores.clamp(1, 16), IntRange::Linear { min: 1, max: 16 }),
         }
     }
@@ -205,6 +211,8 @@ impl OrfeonParams {
                 vowel_rate: self.vowel_rate.value() as f64,
                 vowel_spread: self.vowel_spread.value() as f64,
                 humanize: self.humanize.value() as f64,
+                voice_leading: self.voice_leading.value(),
+                stagger_ms: self.stagger_ms.value() as f64,
                 vibrato: self.vibrato.value() as f64,
                 breath: self.breath.value() as f64,
                 brightness: self.brightness.value() as f64,
@@ -270,6 +278,12 @@ impl OrfeonParams {
         f(setter, &self.vowel_rate, old.vowel_rate, new.vowel_rate);
         f(setter, &self.vowel_spread, old.vowel_spread, new.vowel_spread);
         f(setter, &self.humanize, old.humanize, new.humanize);
+        if old.voice_leading != new.voice_leading {
+            setter.begin_set_parameter(&self.voice_leading);
+            setter.set_parameter(&self.voice_leading, new.voice_leading);
+            setter.end_set_parameter(&self.voice_leading);
+        }
+        f(setter, &self.stagger_ms, old.stagger_ms, new.stagger_ms);
         f(setter, &self.vibrato, old.vibrato, new.vibrato);
         f(setter, &self.breath, old.breath, new.breath);
         f(setter, &self.brightness, old.brightness, new.brightness);

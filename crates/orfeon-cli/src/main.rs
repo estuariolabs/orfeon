@@ -32,6 +32,7 @@ fn usage() -> ! {
          --score ARCHIVO      partitura de texto: una nota por línea, \"inicio duración nota [velocidad]\"\n  \
          --mode coro|tutti|solo   --singers N   --style 1..8   --room 1..5\n  \
          --vowel a|e|i|o|u    --voices N (tope simultáneo)   --eco (calidad económica)\n  \
+         --sin-fraseo         desactiva conducción y escalonado para comparar\n  \
          --threads N          hilos de cálculo (por defecto: los de la máquina)\n  \
          --tail SEG           segundos de cola al final (por defecto 3)"
     );
@@ -128,6 +129,10 @@ fn parse(args: &[String]) -> Opts {
                 o.params.vowel_x = x;
                 o.params.vowel_y = y;
                 i += 1;
+            }
+            "--sin-fraseo" => {
+                o.params.voice_leading = false;
+                o.params.stagger_ms = 0.0;
             }
             "--eco" => o.params.quality = Quality::Eco,
             "--threads" => {

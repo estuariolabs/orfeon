@@ -86,6 +86,10 @@ pub struct ChoirParams {
     pub vowel_spread: f64,
     /// cuánto se apartan entre sí en afinación, entrada e intensidad (0..1)
     pub humanize: f64,
+    /// En Coro, favorece el registro central y la cercanía a la nota anterior.
+    pub voice_leading: bool,
+    /// Separación de ataque de grave a agudo, en milisegundos (0..40).
+    pub stagger_ms: f64,
     /// multiplicador del vibrato del estilo (0..2)
     pub vibrato: f64,
     /// aire agregado a la voz (-0.5..0.5)
@@ -127,6 +131,8 @@ impl ChoirParams {
         vowel_rate: 0.25,
         vowel_spread: 0.5,
         humanize: 0.6,
+        voice_leading: false,
+        stagger_ms: 0.0,
         vibrato: 1.0,
         breath: 0.0,
         brightness: 0.0,
@@ -763,7 +769,13 @@ impl Choir {
             let (lo, hi) = s.singer.voice_type.range();
             let out = if key < lo { (lo - key) as f64 } else if key > hi { (key - hi) as f64 } else { 0.0 };
             // en registro primero; entre iguales, el que no está apagando una cola, y el turno
-            let score = out * 10.0 + if s.active { 1.0 } else { 0.0 } + j as f64 * 0.001;
+            let mut score = out * 10.0 + if s.active { 1.0 } else { 0.0 } + j as f64 * 0.001;
+            if self.params.voice_leading {
+                let center = (f64::from(lo) + f64::from(hi)) * 0.5;
+                let target = s.singer.fold(f64::from(key));
+                let previous = if s.born > 0 { s.key } else { center };
+                score += (target - previous).abs() + 0.25 * (target - center).abs();
+            }
             if best.map_or(true, |(_, b)| score < b) {
                 best = Some((i, score));
             }
@@ -776,7 +788,13 @@ impl Choir {
         let order = self.order;
         let mut g = self.slot(i);
         if let Some(s) = g.as_mut() {
-            let delay = (s.singer.lateness * self.params.humanize * 0.035 * self.fs) as i64;
+            let human_delay = s.singer.lateness * self.params.humanize * 0.035;
+            let (low, _) = s.singer.voice_type.range();
+            // Bajo a soprano ocupa tres separaciones de ataque (E2..C4).
+            let register = f64::from(low.saturating_sub(40).min(20)) * 3.0 / 20.0;
+            let stagger_ms = self.params.stagger_ms;
+            let stagger = if stagger_ms.is_finite() { stagger_ms.clamp(0.0, 40.0) } else { 0.0 };
+            let delay = ((human_delay + register * stagger / 1000.0) * self.fs) as i64;
             let k = s.singer.fold(key as f64);
             if s.held {
                 s.release(); // repetida o robada: ataca de nuevo
@@ -1009,5 +1027,42 @@ fn soft(x: f32) -> f32 {
 impl Drop for Choir {
     fn drop(&mut self) {
         self.stop_workers();
+    }
+}
+
+#[cfg(test)]
+mod phrasing_tests {
+    use super::*;
+
+    #[test]
+    fn cuarteto_conserva_tono_comun_y_prefiere_el_movimiento_corto() {
+        let mut choir = Choir::new(48_000.0, 1);
+        let preset = crate::preset::find("Cuarteto coral").unwrap();
+        choir.set_params(ChoirParams { humanize: 0.0, ..preset.params });
+        for key in [48, 55, 64, 72] {
+            choir.note_on(i32::from(key), key, 0.75);
+        }
+        // Mixto ordena soprano, bajo, contralto y tenor.
+        let state = |choir: &Choir, i| {
+            let slot = choir.slot(i);
+            let slot = slot.as_ref().unwrap();
+            (slot.note_id, slot.born, slot.wait)
+        };
+        assert_eq!(state(&choir, 1).0, 48);
+        assert_eq!(state(&choir, 3).0, 55);
+        assert_eq!(state(&choir, 2).0, 64);
+        assert_eq!(state(&choir, 0).0, 72);
+        assert!(state(&choir, 1).2 < state(&choir, 3).2);
+        assert!(state(&choir, 3).2 < state(&choir, 2).2);
+        assert!(state(&choir, 2).2 < state(&choir, 0).2);
+
+        let soprano = state(&choir, 0);
+        choir.note_off(55);
+        choir.note_off(64);
+        choir.note_on(63, 63, 0.75);
+        assert_eq!(state(&choir, 2).0, 63);
+        assert_eq!(state(&choir, 0), soprano);
+        choir.all_notes_off();
+        assert!((0..4).all(|i| state(&choir, i).0 == -1));
     }
 }

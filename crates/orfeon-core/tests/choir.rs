@@ -268,7 +268,7 @@ fn todos_los_programas_suenan() {
     let mut names: Vec<&str> = PRESETS.iter().map(|p| p.name).collect();
     names.sort();
     names.dedup();
-    assert_eq!(names.len(), 36, "hay programas con el mismo nombre o sin nombre");
+    assert_eq!(names.len(), PRESETS.len(), "hay programas con el mismo nombre o sin nombre");
     assert!(PRESETS.iter().all(|p| !p.name.is_empty()));
 }
 

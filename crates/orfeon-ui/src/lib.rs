@@ -402,6 +402,11 @@ fn tab_voice(ui: &mut Ui, m: &mut Model) {
     slider_f(ui, &mut m.params.breath, -0.5, 0.5, "aire");
     slider_f(ui, &mut m.params.brightness, -0.5, 0.5, "brillo");
     slider_f(ui, &mut m.params.humanize, 0.0, 1.0, "humanizar (afinación, entradas, balanceo)");
+    if m.params.mode == Mode::Coro {
+        ui.checkbox(&mut m.params.voice_leading, "Conducción vocal")
+            .on_hover_text("Favorece movimientos cortos de cada cantante al llegar notas nuevas");
+        slider_f(ui, &mut m.params.stagger_ms, 0.0, 40.0, "separación de entradas (ms)");
+    }
     ui.label(RichText::new("Cada cantante deriva, respira y entra un poco a su manera; humanizar en 0 los alinea a todos.").color(DIM).small());
 }
 
