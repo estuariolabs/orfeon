@@ -271,17 +271,57 @@ fn midi_connect(index: usize, tx: Sender<Msg>, producer: std::thread::Thread) ->
     let ports = input.ports();
     let port = ports.get(index).ok_or_else(|| format!("no hay una entrada MIDI {}", index + 1))?;
     let name = input.port_name(port).unwrap_or_else(|_| "(sin nombre)".into());
+    let monitor = if std::env::var_os("ORFEON_MONITOR_MIDI").is_some() {
+        let (log, records) = std::sync::mpsc::sync_channel::<(u64, [u8; 3], usize, u64)>(4096);
+        let port_name = name.clone();
+        std::thread::Builder::new().name("orfeon-midi-monitor".into()).spawn(move || {
+            eprintln!("MIDI monitor: {port_name}");
+            let mut notes = [[false; 128]; 16];
+            for (stamp, bytes, len, dropped) in records {
+                if dropped > 0 {
+                    eprintln!("MIDI monitor: {dropped} registros omitidos; contador parcial hasta el próximo CC 120/123");
+                }
+                let [status, note, velocity] = bytes;
+                if len == 3 && note < 128 {
+                    match status & 0xF0 {
+                        0x80 | 0x90 => {
+                            notes[(status & 15) as usize][note as usize] =
+                                status & 0xF0 == 0x90 && velocity > 0;
+                        }
+                        0xB0 if note == 120 || note == 123 => notes = [[false; 128]; 16],
+                        _ => {}
+                    }
+                }
+                let held = notes.iter().flatten().filter(|&&held| held).count();
+                eprintln!("MIDI {stamp:>12} μs {:02X?}  notas recibidas sostenidas: {held}", &bytes[..len]);
+            }
+        }).map_err(|e| e.to_string())?;
+        Some(log)
+    } else {
+        None
+    };
+    let mut lost_records = 0u64;
     let conn = input
         .connect(
             port,
             "orfeon-entrada",
-            move |_stamp, msg, _| {
-                if msg.len() < 2 {
+            move |stamp, msg, _| {
+                if let Some(log) = &monitor {
+                    let mut bytes = [0; 3];
+                    let len = msg.len().min(bytes.len());
+                    bytes[..len].copy_from_slice(&msg[..len]);
+                    if log.try_send((stamp, bytes, len, lost_records)).is_ok() {
+                        lost_records = 0;
+                    } else {
+                        lost_records += 1;
+                    }
+                }
+                if msg.len() < 3 {
                     return;
                 }
                 let (status, ch) = (msg[0] & 0xF0, (msg[0] & 0x0F) as i32);
                 let d1 = msg[1] & 0x7F;
-                let d2 = msg.get(2).copied().unwrap_or(0) & 0x7F;
+                let d2 = msg[2] & 0x7F;
                 let id = ch * 128 + d1 as i32;
                 let m = match status {
                     0x90 if d2 > 0 => Some(Msg::On(id, d1, d2 as f64 / 127.0)),

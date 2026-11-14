@@ -146,6 +146,7 @@ fn load_preset(m: &mut Model, i: usize) {
 /// Dibuja la interfaz completa. Devuelve `true` si cambió algún parámetro.
 pub fn show(ctx: &egui::Context, m: &mut Model, tel: &Telemetry, host: Option<&Standalone>, events: &mut Vec<Event>) -> bool {
     let before = m.params;
+    let mut panic = ctx.input(|input| input.key_pressed(egui::Key::Escape));
     // fondo de toda la ventana: entre paneles no queda negro
     ctx.layer_painter(egui::LayerId::background()).rect_filled(ctx.screen_rect(), 0.0, PANEL);
     m.phase = (m.phase + m.params.vowel_rate.clamp(0.0, 20.0) as f32 / 30.0).fract();
@@ -155,6 +156,7 @@ pub fn show(ctx: &egui::Context, m: &mut Model, tel: &Telemetry, host: Option<&S
     egui::TopBottomPanel::top("orfeon-barra").exact_height(48.0).frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::symmetric(12, 8))).show(ctx, |ui| {
         ui.horizontal_centered(|ui| {
             ui.label(RichText::new("ORFEÓN").size(22.0).color(GOLD).strong());
+            panic |= ui.button("Pánico").on_hover_text("Silenciar todo (Esc)").clicked();
             ui.add_space(14.0);
             // programas
             if ui.button("◀").on_hover_text("programa anterior").clicked() {
@@ -308,6 +310,9 @@ pub fn show(ctx: &egui::Context, m: &mut Model, tel: &Telemetry, host: Option<&S
         }
     });
 
+    if panic {
+        events.push(Event::AllOff);
+    }
     m.params != before
 }
 
@@ -492,10 +497,6 @@ fn tab_settings(ui: &mut Ui, m: &mut Model, tel: &Telemetry, host: Option<&Stand
                 }
             });
         });
-    }
-    ui.add_space(10.0);
-    if ui.button("Silenciar todo (pánico)").clicked() {
-        events.push(Event::AllOff);
     }
     ui.add_space(10.0);
     ui.separator();

@@ -522,8 +522,13 @@ impl Plugin for Orfeon {
                             NoteEvent::PolyBrightness { channel, note, brightness, .. } => choir.note_brightness(note_id(channel, note), brightness as f64),
                             // rueda de afinación: ±2 semitonos
                             NoteEvent::MidiPitchBend { value, .. } => choir.set_pitch_bend((value as f64 - 0.5) * 4.0),
-                            // CC 123: todas las notas fuera
-                            NoteEvent::MidiCC { cc: 123, .. } => choir.all_notes_off(),
+                            // CC 120 / 123: mismo alcance global que en la app.
+                            NoteEvent::MidiCC { cc: 120 | 123, .. } => {
+                                choir.all_notes_off();
+                                for h in &self.shared.held {
+                                    h.store(false, Ordering::Relaxed);
+                                }
+                            }
                             _ => {}
                         }
                         next = context.next_event();
