@@ -1,18 +1,29 @@
 //! Orfeón independiente: abre la salida de audio por defecto, escucha un teclado MIDI si hay
 //! uno, y recibe comandos de texto. No necesita un DAW.
 //!
-//! Hilos: el de audio (el que llama la placa de sonido) es dueño del coro; la consola y el
-//! MIDI le mandan mensajes por un canal. Las voces se calculan con los hilos del propio coro.
+//! Hilos:
+//! - "orfeon-audio" es dueño del coro: lo calcula por bloques y lo deja en una cola. Corre con
+//!   prioridad de audio. Consola y MIDI le mandan mensajes por un canal.
+//! - la placa de sonido sólo copia de la cola. Así una demora del cálculo (un hilo que el
+//!   sistema despertó tarde, un cambio de programa) la absorbe el colchón y no se oye.
+//! - los ayudantes del coro calculan voces en paralelo, también con prioridad de audio.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use orfeon_core::console::{self, Command, DEMO, HELP};
 use orfeon_core::preset::PRESETS;
-use orfeon_core::{Choir, ChoirParams};
+use orfeon_core::{Choir, ChoirParams, Mode, Quality};
 use std::io::{BufRead, Write};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Muestras por cálculo del coro (un múltiplo del tramo de 128).
+const PRODUCE: usize = 512;
+/// Colchón de audio por defecto (ms).
+const DEFAULT_LATENCY_MS: u32 = 40;
+/// Carga máxima que se acepta al medir la PC: deja margen para el sistema y los picos.
+const LOAD_TARGET: f64 = 0.55;
 
 /// Lo que la consola y el MIDI le piden al hilo de audio.
 enum Msg {
@@ -24,78 +35,173 @@ enum Msg {
     Threads(usize),
 }
 
-/// Medidores que el hilo de audio deja para la consola.
+/// Medidores compartidos entre los hilos.
 #[derive(Default)]
 struct Meters {
-    /// carga media y máxima, en milésimas del tiempo disponible
+    /// carga media y máxima del cálculo, en milésimas del tiempo disponible
     load: AtomicU32,
     load_max: AtomicU32,
     voices: AtomicUsize,
     /// pico de salida en milésimas
     peak: AtomicU32,
+    /// veces que la placa pidió audio y la cola estaba vacía (cada una es un corte)
+    underruns: AtomicU32,
+    /// colchón pedido, en muestras
+    latency: AtomicUsize,
+    quit: AtomicBool,
 }
 
-struct Engine {
-    choir: Choir,
-    rx: Receiver<Msg>,
-    l: Vec<f32>,
-    r: Vec<f32>,
-    sr: f64,
-    avg: f64,
-    meters: Arc<Meters>,
+// ------------------------------------------------------------------ prioridad (Windows)
+
+#[cfg(windows)]
+fn promote_thread() {
+    use windows_sys::Win32::System::Threading::{AvSetMmThreadCharacteristicsW, GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL};
+    let name: Vec<u16> = "Pro Audio\0".encode_utf16().collect();
+    let mut index = 0u32;
+    // SAFETY: llamadas del sistema sobre el hilo actual, con una cadena terminada en 0.
+    unsafe {
+        let h = AvSetMmThreadCharacteristicsW(name.as_ptr(), &mut index);
+        if h.is_null() {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        }
+    }
 }
 
-const SCRATCH: usize = 4096;
+#[cfg(not(windows))]
+fn promote_thread() {}
 
-impl Engine {
-    /// Atiende los mensajes pendientes y rinde `frames` muestras en `l` / `r`.
-    fn fill(&mut self, frames: usize) {
-        while let Ok(m) = self.rx.try_recv() {
+#[cfg(windows)]
+fn fine_timer() {
+    // SAFETY: pide al sistema un reloj de 1 ms (las esperas cortas dejan de durar 15 ms).
+    unsafe {
+        windows_sys::Win32::Media::timeBeginPeriod(1);
+    }
+}
+
+#[cfg(not(windows))]
+fn fine_timer() {}
+
+// ------------------------------------------------------------------ cálculo del coro
+
+/// El hilo que calcula: atiende mensajes y mantiene la cola llena hasta el colchón pedido.
+fn producer(mut choir: Choir, rx: Receiver<Msg>, mut out: rtrb::Producer<f32>, sr: f64, meters: Arc<Meters>) {
+    promote_thread();
+    let mut l = vec![0f32; PRODUCE];
+    let mut r = vec![0f32; PRODUCE];
+    let mut avg = 0.0f64;
+    let cap = out.buffer().capacity();
+    while !meters.quit.load(Ordering::Relaxed) {
+        while let Ok(m) = rx.try_recv() {
             match m {
-                Msg::On(id, key, vel) => self.choir.note_on(id, key, vel),
-                Msg::Off(id) => self.choir.note_off(id),
-                Msg::Bend(s) => self.choir.set_pitch_bend(s),
-                Msg::AllOff => self.choir.all_notes_off(),
-                Msg::Params(p) => self.choir.set_params(p),
-                Msg::Threads(n) => self.choir.set_threads(n),
+                Msg::On(id, key, vel) => choir.note_on(id, key, vel),
+                Msg::Off(id) => choir.note_off(id),
+                Msg::Bend(s) => choir.set_pitch_bend(s),
+                Msg::AllOff => choir.all_notes_off(),
+                Msg::Params(p) => choir.set_params(p),
+                Msg::Threads(n) => choir.set_threads(n),
             }
+        }
+        let queued = (cap - out.slots()) / 2;
+        let target = meters.latency.load(Ordering::Relaxed);
+        if queued >= target || out.slots() < PRODUCE * 2 {
+            // la cola tiene suficiente: dormir hasta que la placa consuma (ella despierta)
+            std::thread::park_timeout(Duration::from_millis(2));
+            continue;
         }
         let t0 = Instant::now();
-        self.choir.render(&mut self.l[..frames], &mut self.r[..frames]);
-        let load = t0.elapsed().as_secs_f64() / (frames as f64 / self.sr);
-        self.avg += 0.05 * (load - self.avg);
-        let m = &self.meters;
-        m.load.store((self.avg * 1000.0) as u32, Ordering::Relaxed);
-        m.load_max.fetch_max((load * 1000.0) as u32, Ordering::Relaxed);
-        m.voices.store(self.choir.sounding(), Ordering::Relaxed);
-        let pk = self.l[..frames].iter().chain(self.r[..frames].iter()).fold(0f32, |a, x| a.max(x.abs()));
-        m.peak.fetch_max((pk * 1000.0) as u32, Ordering::Relaxed);
+        choir.render(&mut l, &mut r);
+        let load = t0.elapsed().as_secs_f64() / (PRODUCE as f64 / sr);
+        avg += 0.05 * (load - avg);
+        if let Ok(mut chunk) = out.write_chunk_uninit(PRODUCE * 2) {
+            let (a, b) = chunk.as_mut_slices();
+            for (k, slot) in a.iter_mut().chain(b.iter_mut()).enumerate() {
+                let i = k / 2;
+                slot.write(if k % 2 == 0 { l[i] } else { r[i] });
+            }
+            // SAFETY: se escribieron las PRODUCE*2 posiciones pedidas.
+            unsafe { chunk.commit_all() };
+        }
+        meters.load.store((avg * 1000.0) as u32, Ordering::Relaxed);
+        meters.load_max.fetch_max((load * 1000.0) as u32, Ordering::Relaxed);
+        meters.voices.store(choir.sounding(), Ordering::Relaxed);
+        let pk = l.iter().chain(r.iter()).fold(0f32, |a, x| a.max(x.abs()));
+        meters.peak.fetch_max((pk * 1000.0) as u32, Ordering::Relaxed);
     }
 }
 
-/// Llena el buffer de la placa (intercalado, `channels` canales) en el formato que pida.
-fn write<T: cpal::SizedSample + cpal::FromSample<f32>>(eng: &mut Engine, data: &mut [T], channels: usize) {
+// ------------------------------------------------------------------ salida de audio
+
+struct Output {
+    queue: rtrb::Consumer<f32>,
+    producer: std::thread::Thread,
+    meters: Arc<Meters>,
+    started: bool,
+}
+
+/// La placa pide `data` (intercalado, `channels` canales): copiar de la cola, nada más.
+fn write<T: cpal::SizedSample + cpal::FromSample<f32>>(o: &mut Output, data: &mut [T], channels: usize) {
     let channels = channels.max(1);
-    for block in data.chunks_mut(SCRATCH * channels) {
-        let frames = block.len() / channels;
-        eng.fill(frames);
-        for (i, frame) in block.chunks_mut(channels).enumerate() {
-            for (c, out) in frame.iter_mut().enumerate() {
-                let x = match c {
-                    0 if channels == 1 => 0.5 * (eng.l[i] + eng.r[i]),
-                    0 => eng.l[i],
-                    1 => eng.r[i],
-                    _ => 0.0,
-                };
-                *out = T::from_sample(x);
-            }
+    let mut short = false;
+    for frame in data.chunks_mut(channels) {
+        let (l, r) = if o.queue.slots() >= 2 {
+            o.started = true;
+            (o.queue.pop().unwrap_or(0.0), o.queue.pop().unwrap_or(0.0))
+        } else {
+            short = o.started;
+            (0.0, 0.0)
+        };
+        for (c, out) in frame.iter_mut().enumerate() {
+            let x = match c {
+                0 if channels == 1 => 0.5 * (l + r),
+                0 => l,
+                1 => r,
+                _ => 0.0,
+            };
+            *out = T::from_sample(x);
         }
     }
+    if short {
+        o.meters.underruns.fetch_add(1, Ordering::Relaxed);
+    }
+    o.producer.unpark();
 }
 
-fn build<T: cpal::SizedSample + cpal::FromSample<f32>>(device: &cpal::Device, cfg: &cpal::StreamConfig, mut eng: Engine) -> Result<cpal::Stream, cpal::BuildStreamError> {
+fn build<T: cpal::SizedSample + cpal::FromSample<f32>>(device: &cpal::Device, cfg: &cpal::StreamConfig, mut o: Output) -> Result<cpal::Stream, cpal::BuildStreamError> {
     let channels = cfg.channels as usize;
-    device.build_output_stream(cfg, move |data: &mut [T], _: &cpal::OutputCallbackInfo| write(&mut eng, data, channels), |e| eprintln!("\n[audio] {e}"), None)
+    device.build_output_stream(cfg, move |data: &mut [T], _: &cpal::OutputCallbackInfo| write(&mut o, data, channels), |e| eprintln!("\n[audio] {e}"), None)
+}
+
+// ------------------------------------------------------------------ medir la PC
+
+/// Cuántas voces a la vez aguanta esta máquina con esa calidad, dejando margen.
+fn measure(sr: f64, threads: usize, base: ChoirParams, quality: Quality) -> usize {
+    let mut choir = Choir::with_thread_init(sr, threads, Some(promote_thread));
+    let mut l = vec![0f32; PRODUCE];
+    let mut r = vec![0f32; PRODUCE];
+    let mut best = 1;
+    for n in [1usize, 2, 3, 4, 6, 8, 10, 12, 16, 20, 24, 32, 48, 64] {
+        let p = ChoirParams { mode: Mode::Coro, singers: n.max(base.singers).min(64), max_voices: n, quality, humanize: 0.0, ..base };
+        choir.set_params(p);
+        choir.all_notes_off();
+        for i in 0..n {
+            choir.note_on(i as i32, 48 + ((i * 5) % 30) as u8, 0.7);
+        }
+        // que entren todas antes de medir
+        for _ in 0..(0.1 * sr) as usize / PRODUCE {
+            choir.render(&mut l, &mut r);
+        }
+        let blocks = ((0.25 * sr) as usize / PRODUCE).max(4);
+        let t0 = Instant::now();
+        for _ in 0..blocks {
+            choir.render(&mut l, &mut r);
+        }
+        let load = t0.elapsed().as_secs_f64() / (blocks * PRODUCE) as f64 * sr;
+        if load > LOAD_TARGET {
+            break;
+        }
+        best = n;
+    }
+    best
 }
 
 // ------------------------------------------------------------------ MIDI
@@ -108,7 +214,7 @@ fn midi_ports() -> Vec<String> {
 }
 
 /// Se conecta a la entrada `index` (desde 0). La conexión vive mientras se guarde el valor.
-fn midi_connect(index: usize, tx: Sender<Msg>) -> Result<(midir::MidiInputConnection<()>, String), String> {
+fn midi_connect(index: usize, tx: Sender<Msg>, producer: std::thread::Thread) -> Result<(midir::MidiInputConnection<()>, String), String> {
     let mut input = midir::MidiInput::new("Orfeon").map_err(|e| e.to_string())?;
     input.ignore(midir::Ignore::All);
     let ports = input.ports();
@@ -137,6 +243,7 @@ fn midi_connect(index: usize, tx: Sender<Msg>) -> Result<(midir::MidiInputConnec
                 };
                 if let Some(m) = m {
                     let _ = tx.send(m);
+                    producer.unpark();
                 }
             },
             (),
@@ -165,6 +272,7 @@ fn play_later(tx: &Sender<Msg>, start: f64, secs: f64, keys: Vec<u8>, first_id: 
 fn main() {
     println!("Orfeón {} — coro de cantantes modelados físicamente", env!("CARGO_PKG_VERSION"));
     println!("Motor de voz: CHIMERA (Jameson Hodge, MIT). Software libre, GPL-3.0-or-later.\n");
+    fine_timer();
 
     // ---- salida de audio ----
     let host = cpal::default_host();
@@ -183,21 +291,46 @@ fn main() {
     let cfg: cpal::StreamConfig = supported.into();
     let sr = cfg.sample_rate.0 as f64;
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
-    let mut threads = cores.clamp(1, 16);
+    // un núcleo queda para el sistema, la placa de sonido y esta ventana
+    let mut threads = cores.saturating_sub(1).clamp(1, 16);
 
-    let (tx, rx) = channel::<Msg>();
-    let meters = Arc::new(Meters::default());
+    // ---- cuántas voces aguanta esta PC ----
+    print!("midiendo esta PC ({cores} núcleos)... ");
+    let _ = std::io::stdout().flush();
     let mut params = PRESETS[0].params;
-    params.max_voices = params.max_voices.min((cores * 2).max(2));
-    let mut choir = Choir::new(sr, threads);
-    choir.set_params(params);
-    let eng = Engine { choir, rx, l: vec![0.0; SCRATCH], r: vec![0.0; SCRATCH], sr, avg: 0.0, meters: meters.clone() };
+    let alta = measure(sr, threads, params, Quality::Alta);
+    params.quality = Quality::Alta;
+    params.max_voices = alta;
+    if alta < 4 {
+        let eco = measure(sr, threads, params, Quality::Eco);
+        if eco > alta {
+            params.quality = Quality::Eco;
+            params.max_voices = eco;
+        }
+    }
+    println!("aguanta {} voces a la vez{}", params.max_voices, if params.quality == Quality::Eco { " en calidad Eco" } else { "" });
 
+    // ---- hilo que calcula + cola hacia la placa ----
+    let meters = Arc::new(Meters::default());
+    meters.latency.store((sr * DEFAULT_LATENCY_MS as f64 / 1000.0) as usize, Ordering::Relaxed);
+    let (queue_in, queue_out) = rtrb::RingBuffer::<f32>::new((sr * 0.5) as usize * 2);
+    let (tx, rx) = channel::<Msg>();
+    let mut choir = Choir::with_thread_init(sr, threads, Some(promote_thread));
+    choir.set_params(params);
+    let m2 = meters.clone();
+    let worker = std::thread::Builder::new().name("orfeon-audio".into()).spawn(move || producer(choir, rx, queue_in, sr, m2)).expect("no pude crear el hilo de audio");
+    let producer_thread = worker.thread().clone();
+    let notify = |tx: &Sender<Msg>, m: Msg| {
+        let _ = tx.send(m);
+        producer_thread.unpark();
+    };
+
+    let output = Output { queue: queue_out, producer: producer_thread.clone(), meters: meters.clone(), started: false };
     let stream = match format {
-        cpal::SampleFormat::F32 => build::<f32>(&device, &cfg, eng),
-        cpal::SampleFormat::I16 => build::<i16>(&device, &cfg, eng),
-        cpal::SampleFormat::U16 => build::<u16>(&device, &cfg, eng),
-        cpal::SampleFormat::I32 => build::<i32>(&device, &cfg, eng),
+        cpal::SampleFormat::F32 => build::<f32>(&device, &cfg, output),
+        cpal::SampleFormat::I16 => build::<i16>(&device, &cfg, output),
+        cpal::SampleFormat::U16 => build::<u16>(&device, &cfg, output),
+        cpal::SampleFormat::I32 => build::<i32>(&device, &cfg, output),
         other => {
             eprintln!("La salida de audio usa un formato que no manejo ({other:?}).");
             wait_and_exit(1);
@@ -214,7 +347,7 @@ fn main() {
         eprintln!("No pude arrancar el audio: {e}");
         wait_and_exit(1);
     }
-    println!("audio:  {} — {} Hz, {} canales", device.name().unwrap_or_else(|_| "salida por defecto".into()), sr as u32, cfg.channels);
+    println!("audio:  {} — {} Hz, {} canales, colchón {DEFAULT_LATENCY_MS} ms", device.name().unwrap_or_else(|_| "salida por defecto".into()), sr as u32, cfg.channels);
 
     // ---- MIDI: la primera entrada, si hay ----
     let mut midi: Option<midir::MidiInputConnection<()>> = None;
@@ -222,7 +355,7 @@ fn main() {
     if ports.is_empty() {
         println!("midi:   no hay teclados MIDI conectados (se puede tocar con el comando n)");
     } else {
-        match midi_connect(0, tx.clone()) {
+        match midi_connect(0, tx.clone(), producer_thread.clone()) {
             Ok((c, name)) => {
                 println!("midi:   {name}{}", if ports.len() > 1 { format!("  (hay {}; ver: midi)", ports.len()) } else { String::new() });
                 midi = Some(c);
@@ -236,6 +369,7 @@ fn main() {
     // ---- comandos ----
     let stdin = std::io::stdin();
     let mut next_id = 1_000_000i32;
+    let mut seen_underruns = 0u32;
     loop {
         print!("> ");
         let _ = std::io::stdout().flush();
@@ -256,7 +390,7 @@ fn main() {
             }
             Ok(Command::Params(p, msg)) => {
                 params = p;
-                let _ = tx.send(Msg::Params(p));
+                notify(&tx, Msg::Params(p));
                 println!("  {msg}");
             }
             Ok(Command::Play(keys, secs)) => {
@@ -271,13 +405,15 @@ fn main() {
                 }
                 println!("  demo: 16 segundos");
             }
-            Ok(Command::AllOff) => {
-                let _ = tx.send(Msg::AllOff);
-            }
+            Ok(Command::AllOff) => notify(&tx, Msg::AllOff),
             Ok(Command::Threads(n)) => {
                 threads = n;
-                let _ = tx.send(Msg::Threads(n));
+                notify(&tx, Msg::Threads(n));
                 println!("  hilos: {n}");
+            }
+            Ok(Command::Latency(ms)) => {
+                meters.latency.store((sr * ms as f64 / 1000.0) as usize, Ordering::Relaxed);
+                println!("  colchón de audio: {ms} ms");
             }
             Ok(Command::Midi(None)) => {
                 let ports = midi_ports();
@@ -290,7 +426,7 @@ fn main() {
             }
             Ok(Command::Midi(Some(n))) => {
                 midi = None; // suelta la anterior antes de abrir otra
-                match midi_connect(n - 1, tx.clone()) {
+                match midi_connect(n - 1, tx.clone(), producer_thread.clone()) {
                     Ok((c, name)) => {
                         println!("  midi: {name}");
                         midi = Some(c);
@@ -302,16 +438,27 @@ fn main() {
                 let load = meters.load.load(Ordering::Relaxed) as f64 / 10.0;
                 let max = meters.load_max.swap(0, Ordering::Relaxed) as f64 / 10.0;
                 let peak = meters.peak.swap(0, Ordering::Relaxed) as f64 / 1000.0;
+                let under = meters.underruns.load(Ordering::Relaxed);
+                let latency_ms = meters.latency.load(Ordering::Relaxed) as f64 * 1000.0 / sr;
                 println!("  carga: {load:.0} % (máximo desde el último info: {max:.0} %)   voces sonando: {}   pico: {peak:.2}", meters.voices.load(Ordering::Relaxed));
+                println!("  cortes: {} desde el último info ({under} en total)   colchón: {latency_ms:.0} ms", under - seen_underruns);
                 println!("  {} · {} cantantes · {} · {} · {} · tope {} voces · {:?} · {threads} hilos", params.mode.name(), params.singers, params.ensemble.name(), params.style.def().name, params.room.name(), params.max_voices, params.quality);
-                if max > 90.0 {
-                    println!("  la carga pasó el 90 %: si se entrecorta, probá  voces {}  o  eco si", (params.max_voices / 2).max(1));
+                if under > seen_underruns {
+                    if max > 100.0 {
+                        println!("  el cálculo no llega a tiempo: probá  voces {}  o  eco si", (params.max_voices * 2 / 3).max(1));
+                    } else {
+                        println!("  el cálculo llega, pero el sistema lo demora: probá  latencia {}", (latency_ms * 2.0).min(200.0) as u32);
+                    }
                 }
+                seen_underruns = under;
             }
         }
     }
+    meters.quit.store(true, Ordering::Relaxed);
+    producer_thread.unpark();
     drop(midi);
     drop(stream);
+    let _ = worker.join();
 }
 
 /// En Windows la ventana se cierra sola al terminar: deja leer el error antes.

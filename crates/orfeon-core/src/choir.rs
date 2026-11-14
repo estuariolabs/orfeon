@@ -21,6 +21,11 @@ use std::thread::JoinHandle;
 
 /// Muestras por tramo de control (a la frecuencia del anfitrión).
 pub const CHUNK: usize = 128;
+/// Tramos que cada hilo calcula por vez. Despertar a los hilos ayudantes cuesta (en Windows,
+/// mucho y de forma irregular): se los despierta una vez cada BLOCK_CHUNKS tramos, no en cada
+/// uno. El resultado es el mismo muestra a muestra.
+const BLOCK_CHUNKS: usize = 8;
+const BLOCK: usize = CHUNK * BLOCK_CHUNKS;
 /// Frecuencia interna del modo Eco: la más baja a la que el motor simula a 2x (ver
 /// `oversample_for`). Cuesta ~2/3 de la calidad Alta y llega hasta 15 kHz.
 const ECO_RATE: f64 = 30100.0;
@@ -172,8 +177,10 @@ struct Slot {
     frac: f64,
     hist: [f32; 4],
     ebuf: [f32; CHUNK + 8],
-    /// salida mono del tramo
-    out: [f32; CHUNK],
+    /// salida mono del bloque (BLOCK_CHUNKS tramos)
+    out: [f32; BLOCK],
+    /// en qué tramos del bloque la voz se calculó (y entra en la mezcla)
+    wanted: [bool; BLOCK_CHUNKS],
     // --- nota ---
     note_id: i32,
     /// altura cantada (MIDI, ya llevada a su registro)
@@ -215,7 +222,8 @@ impl Slot {
             frac: 0.0,
             hist: [0.0; 4],
             ebuf: [0.0; CHUNK + 8],
-            out: [0.0; CHUNK],
+            out: [0.0; BLOCK],
+            wanted: [false; BLOCK_CHUNKS],
             note_id: -1,
             key: 60.0,
             held: false,
@@ -260,8 +268,19 @@ impl Slot {
         self.wait = -1;
     }
 
-    /// Control + audio de un tramo. Devuelve si la voz sigue activa.
-    fn render_chunk(&mut self, c: &Ctl) -> bool {
+    /// Los tramos de un bloque, cada uno con su control. Anota en cuáles la voz se calculó.
+    fn render_block(&mut self, ctls: &[Ctl]) {
+        for (k, c) in ctls.iter().enumerate() {
+            let wanted = self.active || self.wait >= 0;
+            self.wanted[k] = wanted;
+            if wanted {
+                self.render_chunk(c, k * CHUNK);
+            }
+        }
+    }
+
+    /// Control + audio de un tramo, escrito en `out[off..]`. Devuelve si la voz sigue activa.
+    fn render_chunk(&mut self, c: &Ctl, off: usize) -> bool {
         let n = c.n;
         if self.wait >= 0 {
             if self.wait >= n as i64 {
@@ -274,7 +293,7 @@ impl Slot {
             }
         }
         if !self.active {
-            self.out[..n].fill(0.0);
+            self.out[off..off + n].fill(0.0);
             return false;
         }
         let sounding = self.held && self.wait < 0;
@@ -321,13 +340,13 @@ impl Slot {
 
         // ---- audio ----
         if self.eco {
-            self.render_eco(n);
+            self.render_eco(off, n);
         } else {
-            self.voice.render(&mut self.out[..n]);
+            self.voice.render(&mut self.out[off..off + n]);
         }
         let g = sg.gain as f32;
         let mut peak = 0f32;
-        for x in self.out[..n].iter_mut() {
+        for x in self.out[off..off + n].iter_mut() {
             if !x.is_finite() {
                 *x = 0.0; // una voz que se rompe no arrastra al coro
             }
@@ -350,7 +369,7 @@ impl Slot {
 
     /// Modo Eco: el motor rinde a ~30 kHz y se lleva a la frecuencia del anfitrión con una
     /// interpolación cúbica (Hermite de 4 puntos).
-    fn render_eco(&mut self, n: usize) {
+    fn render_eco(&mut self, off: usize, n: usize) {
         let need = (self.frac + n as f64 * self.ratio).floor() as usize;
         let need = need.min(CHUNK + 8);
         self.voice.render(&mut self.ebuf[..need]);
@@ -367,7 +386,7 @@ impl Slot {
             let c1 = 0.5 * (y2 - y0);
             let c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
             let c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
-            self.out[i] = ((c3 * t + c2) * t + c1) * t + y1;
+            self.out[off + i] = ((c3 * t + c2) * t + c1) * t + y1;
         }
     }
 }
@@ -383,7 +402,8 @@ struct Shared {
     slots: Vec<Mutex<Option<Slot>>>,
     job: Mutex<Job>,
     cv: Condvar,
-    ctl: Mutex<Ctl>,
+    /// controles de cada tramo del bloque y cuántos tramos tiene
+    ctl: Mutex<([Ctl; BLOCK_CHUNKS], usize)>,
     list: Mutex<[usize; MAX_SINGERS]>,
     next: AtomicUsize,
     total: AtomicUsize,
@@ -398,7 +418,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Shared {
     /// Toma voces de la lista hasta que no queden. Lo corren los ayudantes y el hilo de audio.
     fn work(&self) {
-        let ctl = *lock(&self.ctl);
+        let (ctls, nc) = *lock(&self.ctl);
         loop {
             let i = self.next.fetch_add(1, Ordering::AcqRel);
             if i >= self.total.load(Ordering::Acquire) {
@@ -406,14 +426,17 @@ impl Shared {
             }
             let idx = lock(&self.list)[i];
             if let Some(slot) = lock(&self.slots[idx]).as_mut() {
-                slot.render_chunk(&ctl);
+                slot.render_block(&ctls[..nc]);
             }
             self.done.fetch_add(1, Ordering::AcqRel);
         }
     }
 }
 
-fn worker(shared: Arc<Shared>) {
+fn worker(shared: Arc<Shared>, init: Option<fn()>) {
+    if let Some(f) = init {
+        f();
+    }
     let mut seen = 0u64;
     loop {
         {
@@ -450,18 +473,25 @@ pub struct Choir {
     vowel_phase: f64,
     active: [usize; MAX_SINGERS],
     n_active: usize,
+    thread_init: Option<fn()>,
 }
 
 impl Choir {
     /// `threads`: hilos para calcular voces (1 = todo en el hilo de audio).
     pub fn new(sample_rate: f64, threads: usize) -> Choir {
+        Choir::with_thread_init(sample_rate, threads, None)
+    }
+
+    /// Como `new`, pero cada hilo ayudante corre `init` al arrancar (por ejemplo, para pedirle
+    /// al sistema prioridad de audio). El núcleo no sabe nada del sistema operativo.
+    pub fn with_thread_init(sample_rate: f64, threads: usize, init: Option<fn()>) -> Choir {
         chimera::init();
         let ctl = Ctl { style: Style::Clasico.def(), vx: 0.45, vy: 1.0, spread: 0.0, vibrato: 1.0, breath: 0.0, bright: 0.0, humanize: 0.0, bend: 0.0, n: 0, dt: 0.0 };
         let shared = Arc::new(Shared {
             slots: (0..MAX_SINGERS).map(|_| Mutex::new(None)).collect(),
             job: Mutex::new(Job { gen: 0, quit: false }),
             cv: Condvar::new(),
-            ctl: Mutex::new(ctl),
+            ctl: Mutex::new(([ctl; BLOCK_CHUNKS], 0)),
             list: Mutex::new([0; MAX_SINGERS]),
             next: AtomicUsize::new(0),
             total: AtomicUsize::new(0),
@@ -483,6 +513,7 @@ impl Choir {
             vowel_phase: 0.0,
             active: [0; MAX_SINGERS],
             n_active: 0,
+            thread_init: init,
         };
         choir.set_threads(threads);
         choir.rebuild();
@@ -499,7 +530,8 @@ impl Choir {
         self.stop_workers();
         for i in 0..want {
             let sh = self.shared.clone();
-            if let Ok(h) = std::thread::Builder::new().name(format!("orfeon-voz-{i}")).spawn(move || worker(sh)) {
+            let init = self.thread_init;
+            if let Ok(h) = std::thread::Builder::new().name(format!("orfeon-voz-{i}")).spawn(move || worker(sh, init)) {
                 self.workers.push(h);
             }
         }
@@ -750,39 +782,49 @@ impl Choir {
         let total = left.len().min(right.len());
         let mut pos = 0;
         while pos < total {
-            let n = (total - pos).min(CHUNK);
-            self.render_chunk(&mut left[pos..pos + n], &mut right[pos..pos + n]);
+            let n = (total - pos).min(BLOCK);
+            self.render_block(&mut left[pos..pos + n], &mut right[pos..pos + n]);
             pos += n;
         }
     }
 
-    fn render_chunk(&mut self, left: &mut [f32], right: &mut [f32]) {
-        let n = left.len();
+    /// Un bloque: hasta BLOCK_CHUNKS tramos de control. Las voces se calculan todas juntas
+    /// (en paralelo) y después se mezclan tramo por tramo.
+    fn render_block(&mut self, left: &mut [f32], right: &mut [f32]) {
+        let total = left.len();
         let p = self.params;
-        let dt = n as f64 / self.fs;
 
-        // ---- la vocal, con su movimiento ----
-        self.vowel_phase += p.vowel_rate.clamp(0.0, 20.0) * dt;
-        if self.vowel_phase >= 1.0 {
-            self.vowel_phase -= self.vowel_phase.floor();
+        // ---- los controles de cada tramo (la vocal se mueve tramo a tramo) ----
+        let mut ctls = [Ctl { style: p.style.def(), vx: 0.0, vy: 0.0, spread: 0.0, vibrato: 0.0, breath: 0.0, bright: 0.0, humanize: 0.0, bend: 0.0, n: 0, dt: 0.0 }; BLOCK_CHUNKS];
+        let mut nc = 0;
+        let mut pos = 0;
+        while pos < total {
+            let n = (total - pos).min(CHUNK);
+            let dt = n as f64 / self.fs;
+            self.vowel_phase += p.vowel_rate.clamp(0.0, 20.0) * dt;
+            if self.vowel_phase >= 1.0 {
+                self.vowel_phase -= self.vowel_phase.floor();
+            }
+            let a = std::f64::consts::TAU * self.vowel_phase;
+            let mv = p.vowel_move.clamp(0.0, 1.0) * 0.4;
+            ctls[nc] = Ctl {
+                style: p.style.def(),
+                vx: p.vowel_x + mv * a.cos(),
+                vy: p.vowel_y + mv * a.sin(),
+                spread: p.vowel_spread.clamp(0.0, 1.0),
+                vibrato: p.vibrato.clamp(0.0, 2.0),
+                breath: p.breath.clamp(-0.5, 0.5),
+                bright: p.brightness.clamp(-0.5, 0.5),
+                humanize: p.humanize.clamp(0.0, 1.0),
+                bend: self.bend,
+                n,
+                dt,
+            };
+            nc += 1;
+            pos += n;
         }
-        let a = std::f64::consts::TAU * self.vowel_phase;
-        let mv = p.vowel_move.clamp(0.0, 1.0) * 0.4;
-        let ctl = Ctl {
-            style: p.style.def(),
-            vx: p.vowel_x + mv * a.cos(),
-            vy: p.vowel_y + mv * a.sin(),
-            spread: p.vowel_spread.clamp(0.0, 1.0),
-            vibrato: p.vibrato.clamp(0.0, 2.0),
-            breath: p.breath.clamp(-0.5, 0.5),
-            bright: p.brightness.clamp(-0.5, 0.5),
-            humanize: p.humanize.clamp(0.0, 1.0),
-            bend: self.bend,
-            n,
-            dt,
-        };
 
-        // ---- qué voces hay que calcular ----
+        // ---- qué voces hay que calcular (dentro del bloque no llegan notas nuevas) ----
         let mut k = 0;
         for i in 0..self.count {
             let wanted = lock(&self.shared.slots[i]).as_ref().map_or(false, |s| s.active || s.wait >= 0);
@@ -791,12 +833,11 @@ impl Choir {
                 k += 1;
             }
         }
-        self.n_active = k;
 
-        // ---- calcularlas (en paralelo si conviene) ----
+        // ---- calcularlas: una sola vez por bloque se despierta a los ayudantes ----
         if k > 0 {
             let sh = &self.shared;
-            *lock(&sh.ctl) = ctl;
+            *lock(&sh.ctl) = (ctls, nc);
             *lock(&sh.list) = self.active;
             sh.done.store(0, Ordering::Release);
             sh.next.store(0, Ordering::Release);
@@ -807,11 +848,11 @@ impl Choir {
                 lock(&sh.job).gen += 1;
                 sh.cv.notify_all();
                 sh.work();
-                // el hilo de audio también trabajó; espera a que los ayudantes suelten lo suyo
+                // este hilo también trabajó; espera a que los ayudantes suelten lo suyo
                 let mut spins = 0u32;
                 while sh.done.load(Ordering::Acquire) < k || sh.busy.load(Ordering::Acquire) > 0 {
                     spins += 1;
-                    if spins < 200 {
+                    if spins < 2000 {
                         std::hint::spin_loop();
                     } else {
                         std::thread::yield_now();
@@ -823,6 +864,22 @@ impl Choir {
             sh.total.store(0, Ordering::Release);
         }
 
+        // ---- mezcla, tramo por tramo ----
+        let mut off = 0;
+        for c in 0..nc {
+            let n = ctls[c].n;
+            self.n_active = self.mix_chunk(c, k, &mut left[off..off + n], &mut right[off..off + n]);
+            off += n;
+        }
+    }
+
+    /// Mezcla el tramo `c` del bloque: las voces que se calcularon en él, en su lugar del
+    /// escenario, más la sala. Devuelve cuántas voces sonaron en el tramo.
+    fn mix_chunk(&mut self, c: usize, listed: usize, left: &mut [f32], right: &mut [f32]) -> usize {
+        let n = left.len();
+        let p = self.params;
+        let base = c * CHUNK;
+        let mut sounding = 0;
         // ---- escenario: cada voz en su lugar, y lo que le llega a la sala ----
         const SCR: usize = CHUNK;
         let mut dry_l = [0f32; SCR];
@@ -831,10 +888,14 @@ impl Choir {
         let mut snd_r = [0f32; SCR];
         let mic = p.mic.clamp(0.0, 1.0);
         let width = p.width.clamp(0.0, 1.0) * (1.0 - 0.45 * mic);
-        for a in 0..k {
+        for a in 0..listed {
             let idx = self.active[a];
             let mut g = self.slot(idx);
             let Some(s) = g.as_mut() else { continue };
+            if !s.wanted[c] {
+                continue;
+            }
+            sounding += 1;
             let dist = (0.5 * mic + 0.6 * s.singer.depth * p.depth.clamp(0.0, 1.0)).clamp(0.0, 1.1);
             let pan = (s.singer.pan * width).clamp(-1.0, 1.0);
             let ang = (pan + 1.0) * std::f64::consts::FRAC_PI_4;
@@ -846,7 +907,7 @@ impl Choir {
             let lp = (1.0 - 0.55 * dist) as f32;
             let mut z = s.dist_lp;
             for i in 0..n {
-                z += lp * (s.out[i] - z);
+                z += lp * (s.out[base + i] - z);
                 dry_l[i] += z * gl;
                 dry_r[i] += z * gr;
                 snd_l[i] += z * send * (ang.cos() as f32);
@@ -867,6 +928,7 @@ impl Choir {
             left[i] = soft((dry_l[i] + wl * wet) * master);
             right[i] = soft((dry_r[i] + wr * wet) * master);
         }
+        sounding
     }
 }
 

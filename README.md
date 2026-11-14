@@ -76,7 +76,12 @@ cargo run --release -p orfeon-app
 ```
 
 Abre la salida de audio por defecto y el primer teclado MIDI que encuentre. Se toca con el
-teclado MIDI o con comandos (`n 48 55 64 72`, `demo`, `p catedral`, `ayuda`). En Linux hace
+teclado MIDI o con comandos (`n 48 55 64 72`, `demo`, `p catedral`, `ayuda`).
+
+Al arrancar mide cuántas voces aguanta la máquina y fija ese tope (si en calidad Alta entran
+menos de 4, pasa a Eco). El coro se calcula en un hilo propio con prioridad de audio y deja
+un colchón de 40 ms; la placa de sonido sólo copia de ese colchón. `info` muestra la carga y
+los cortes; si hay cortes, `latencia 80` agranda el colchón y `voces N` baja el tope. En Linux hace
 falta `libasound2-dev` y `pkg-config` para compilarla.
 
 ### 3. Cuántas voces aguanta tu máquina

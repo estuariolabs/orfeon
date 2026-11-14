@@ -19,6 +19,8 @@ pub enum Command {
     Demo,
     AllOff,
     Threads(usize),
+    /// colchón de audio en milisegundos
+    Latency(u32),
     /// listar las entradas MIDI, o conectarse a la número N (desde 1)
     Midi(Option<usize>),
     Presets,
@@ -46,6 +48,7 @@ comandos (Enter para enviar):
   voces 1..64          tope de cantantes sonando a la vez
   eco si|no            calidad económica (menos CPU)
   hilos 1..16          hilos de cálculo
+  latencia 10..200     colchón de audio en ms (más = menos cortes, más demora al tocar)
   mic 0..1             distancia del micrófono       vol DB   volumen en dB
   humanizar 0..1       vibrato 0..2                  mover 0..1 (la vocal se mueve sola)
   midi                 lista las entradas MIDI       midi N   usa la entrada N
@@ -196,6 +199,7 @@ pub fn parse(line: &str, cur: &ChoirParams) -> Result<Command, String> {
             ok(p, format!("movimiento de la vocal: {:.2}", p.vowel_move))
         }
         "hilos" => Ok(Command::Threads(num(it.next(), "los hilos", 1.0, 16.0)? as usize)),
+        "latencia" => Ok(Command::Latency(num(it.next(), "la latencia (ms)", 10.0, 200.0)? as u32)),
         "midi" => match it.next() {
             None => Ok(Command::Midi(None)),
             Some(t) => Ok(Command::Midi(Some(num(Some(t), "la entrada", 1.0, 64.0)? as usize))),
@@ -222,6 +226,7 @@ mod tests {
         assert_eq!(parse("n 60 64 4", &D), Ok(Command::Play(vec![60, 64], 4.0)));
         assert_eq!(parse("n 60", &D), Ok(Command::Play(vec![60], 2.0)));
         assert_eq!(parse("hilos 4", &D), Ok(Command::Threads(4)));
+        assert_eq!(parse("latencia 60", &D), Ok(Command::Latency(60)));
         assert_eq!(parse("midi", &D), Ok(Command::Midi(None)));
         assert_eq!(parse("midi 2", &D), Ok(Command::Midi(Some(2))));
         let Ok(Command::Params(p, _)) = parse("modo tutti", &D) else { panic!() };
@@ -252,7 +257,7 @@ mod tests {
 
     #[test]
     fn rechaza_lo_que_no_entiende_sin_romperse() {
-        for bad in ["zzz", "p", "p 0", "p 99", "p noexiste", "n", "n hola", "n 200", "n 60.5 61", "modo", "modo x", "vocal", "vocal zz", "vocal 3 4", "estilo 9", "estilo", "sala 0", "voces 0", "voces 999", "eco", "eco quizas", "hilos 0", "vol 99", "mic -1", "midi x", "cantantes nan", "vibrato inf", "n 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19"] {
+        for bad in ["zzz", "p", "p 0", "p 99", "p noexiste", "n", "n hola", "n 200", "n 60.5 61", "modo", "modo x", "vocal", "vocal zz", "vocal 3 4", "estilo 9", "estilo", "sala 0", "voces 0", "voces 999", "eco", "eco quizas", "hilos 0", "latencia 5", "latencia 900", "vol 99", "mic -1", "midi x", "cantantes nan", "vibrato inf", "n 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19"] {
             assert!(parse(bad, &D).is_err(), "\"{bad}\" tendría que dar error");
         }
     }

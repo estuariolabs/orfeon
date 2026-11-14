@@ -14,3 +14,9 @@ orfeon-core = { path = "../orfeon-core" }
 # salida de audio (WASAPI / CoreAudio / ALSA) y entrada MIDI
 cpal = "0.15"
 midir = "0.10"
+# cola sin bloqueos entre el hilo que calcula el coro y el de la placa de sonido
+rtrb = "0.3"
+
+# Windows: prioridad de audio (MMCSS "Pro Audio") y reloj del sistema a 1 ms
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Media"] }
