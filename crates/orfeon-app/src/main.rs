@@ -1,5 +1,10 @@
+// En Windows la app es de ventana: sin consola negra detrás (con --consola se engancha a la
+// consola desde la que se la abrió).
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 //! Orfeón independiente: abre la salida de audio por defecto, escucha un teclado MIDI si hay
-//! uno, y recibe comandos de texto. No necesita un DAW.
+//! uno y muestra la interfaz (la misma del plugin). Con `--consola` funciona sin ventana,
+//! por comandos de texto. No necesita un DAW.
 //!
 //! Hilos:
 //! - "orfeon-audio" es dueño del coro: lo calcula por bloques y lo deja en una cola. Corre con
@@ -17,6 +22,17 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+// En Windows, sin ventana negra de consola detrás de la interfaz.
+#[cfg(windows)]
+fn attach_console() {
+    // SAFETY: si la app se abrió desde una consola, se engancha a ella (modo --consola).
+    unsafe {
+        windows_sys::Win32::System::Console::AttachConsole(windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS);
+    }
+}
+#[cfg(not(windows))]
+fn attach_console() {}
 
 /// Muestras por cálculo del coro (un múltiplo del tramo de 128).
 const PRODUCE: usize = 512;
@@ -36,7 +52,6 @@ enum Msg {
 }
 
 /// Medidores compartidos entre los hilos.
-#[derive(Default)]
 struct Meters {
     /// carga media y máxima del cálculo, en milésimas del tiempo disponible
     load: AtomicU32,
@@ -49,6 +64,27 @@ struct Meters {
     /// colchón pedido, en muestras
     latency: AtomicUsize,
     quit: AtomicBool,
+    /// nivel de cada cantante (bits de f32) y notas sonando, para la interfaz
+    levels: [AtomicU32; orfeon_core::MAX_SINGERS],
+    held: [AtomicBool; 128],
+    threads: AtomicUsize,
+}
+
+impl Default for Meters {
+    fn default() -> Self {
+        Meters {
+            load: AtomicU32::new(0),
+            load_max: AtomicU32::new(0),
+            voices: AtomicUsize::new(0),
+            peak: AtomicU32::new(0),
+            underruns: AtomicU32::new(0),
+            latency: AtomicUsize::new(0),
+            quit: AtomicBool::new(false),
+            levels: std::array::from_fn(|_| AtomicU32::new(0)),
+            held: std::array::from_fn(|_| AtomicBool::new(false)),
+            threads: AtomicUsize::new(1),
+        }
+    }
 }
 
 // ------------------------------------------------------------------ prioridad (Windows)
@@ -93,10 +129,22 @@ fn producer(mut choir: Choir, rx: Receiver<Msg>, mut out: rtrb::Producer<f32>, s
     while !meters.quit.load(Ordering::Relaxed) {
         while let Ok(m) = rx.try_recv() {
             match m {
-                Msg::On(id, key, vel) => choir.note_on(id, key, vel),
-                Msg::Off(id) => choir.note_off(id),
+                Msg::On(id, key, vel) => {
+                    choir.note_on(id, key, vel);
+                    meters.held[(key & 127) as usize].store(true, Ordering::Relaxed);
+                }
+                Msg::Off(id) => {
+                    choir.note_off(id);
+                    // los id de MIDI y de la pantalla son canal*128 + nota
+                    meters.held[id.rem_euclid(128) as usize].store(false, Ordering::Relaxed);
+                }
                 Msg::Bend(s) => choir.set_pitch_bend(s),
-                Msg::AllOff => choir.all_notes_off(),
+                Msg::AllOff => {
+                    choir.all_notes_off();
+                    for h in meters.held.iter() {
+                        h.store(false, Ordering::Relaxed);
+                    }
+                }
                 Msg::Params(p) => choir.set_params(p),
                 Msg::Threads(n) => choir.set_threads(n),
             }
@@ -124,6 +172,9 @@ fn producer(mut choir: Choir, rx: Receiver<Msg>, mut out: rtrb::Producer<f32>, s
         meters.load.store((avg * 1000.0) as u32, Ordering::Relaxed);
         meters.load_max.fetch_max((load * 1000.0) as u32, Ordering::Relaxed);
         meters.voices.store(choir.sounding(), Ordering::Relaxed);
+        for (a, l) in meters.levels.iter().zip(choir.levels().iter()) {
+            a.store(l.to_bits(), Ordering::Relaxed);
+        }
         let pk = l.iter().chain(r.iter()).fold(0f32, |a, x| a.max(x.abs()));
         meters.peak.fetch_max((pk * 1000.0) as u32, Ordering::Relaxed);
     }
@@ -269,34 +320,53 @@ fn play_later(tx: &Sender<Msg>, start: f64, secs: f64, keys: Vec<u8>, first_id: 
     });
 }
 
-fn main() {
-    println!("Orfeón {} — coro de cantantes modelados físicamente", env!("CARGO_PKG_VERSION"));
-    println!("Motor de voz: CHIMERA (Jameson Hodge, MIT). Software libre, GPL-3.0-or-later.\n");
-    fine_timer();
+/// Lo que queda andando después de arrancar el audio.
+struct Running {
+    tx: Sender<Msg>,
+    producer: std::thread::Thread,
+    worker: std::thread::JoinHandle<()>,
+    meters: Arc<Meters>,
+    stream: Option<cpal::Stream>,
+    params: ChoirParams,
+    sr: f64,
+    threads: usize,
+    audio_name: String,
+    channels: u16,
+    status: Option<String>,
+}
 
-    // ---- salida de audio ----
+/// Abre el audio, mide la PC y arranca el hilo del coro. Si no hay salida de audio, el coro
+/// arranca igual (sin sonido) y `status` lo explica.
+fn start(verbose: bool) -> Running {
+    fine_timer();
     let host = cpal::default_host();
-    let Some(device) = host.default_output_device() else {
-        eprintln!("No encontré una salida de audio. Revisá que haya parlantes o auriculares activos.");
-        wait_and_exit(1);
-    };
-    let supported = match device.default_output_config() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("No pude leer la configuración de la salida de audio: {e}");
-            wait_and_exit(1);
+    let device = host.default_output_device();
+    let mut status = None;
+    let (cfg, format) = match device.as_ref().map(|d| d.default_output_config()) {
+        Some(Ok(c)) => {
+            let f = c.sample_format();
+            (Some(c.into()), Some(f))
+        }
+        Some(Err(e)) => {
+            status = Some(format!("No pude leer la salida de audio: {e}"));
+            (None, None)
+        }
+        None => {
+            status = Some("No encontré una salida de audio: revisá que haya parlantes o auriculares activos y volvé a abrir Orfeón.".to_string());
+            (None, None)
         }
     };
-    let format = supported.sample_format();
-    let cfg: cpal::StreamConfig = supported.into();
-    let sr = cfg.sample_rate.0 as f64;
+    let cfg: Option<cpal::StreamConfig> = cfg;
+    let sr = cfg.as_ref().map_or(48000.0, |c| c.sample_rate.0 as f64);
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
-    // un núcleo queda para el sistema, la placa de sonido y esta ventana
-    let mut threads = cores.saturating_sub(1).clamp(1, 16);
+    // un núcleo queda para el sistema, la placa de sonido y la ventana
+    let threads = cores.saturating_sub(1).clamp(1, 16);
 
     // ---- cuántas voces aguanta esta PC ----
-    print!("midiendo esta PC ({cores} núcleos)... ");
-    let _ = std::io::stdout().flush();
+    if verbose {
+        print!("midiendo esta PC ({cores} núcleos)... ");
+        let _ = std::io::stdout().flush();
+    }
     let mut params = PRESETS[0].params;
     let alta = measure(sr, threads, params, Quality::Alta);
     params.quality = Quality::Alta;
@@ -308,11 +378,14 @@ fn main() {
             params.max_voices = eco;
         }
     }
-    println!("aguanta {} voces a la vez{}", params.max_voices, if params.quality == Quality::Eco { " en calidad Eco" } else { "" });
+    if verbose {
+        println!("aguanta {} voces a la vez{}", params.max_voices, if params.quality == Quality::Eco { " en calidad Eco" } else { "" });
+    }
 
     // ---- hilo que calcula + cola hacia la placa ----
     let meters = Arc::new(Meters::default());
     meters.latency.store((sr * DEFAULT_LATENCY_MS as f64 / 1000.0) as usize, Ordering::Relaxed);
+    meters.threads.store(threads, Ordering::Relaxed);
     let (queue_in, queue_out) = rtrb::RingBuffer::<f32>::new((sr * 0.5) as usize * 2);
     let (tx, rx) = channel::<Msg>();
     let mut choir = Choir::with_thread_init(sr, threads, Some(promote_thread));
@@ -320,35 +393,193 @@ fn main() {
     let m2 = meters.clone();
     let worker = std::thread::Builder::new().name("orfeon-audio".into()).spawn(move || producer(choir, rx, queue_in, sr, m2)).expect("no pude crear el hilo de audio");
     let producer_thread = worker.thread().clone();
+
+    let mut stream = None;
+    let mut audio_name = "sin salida de audio".to_string();
+    let mut channels = 0;
+    if let (Some(device), Some(cfg), Some(format)) = (device.as_ref(), cfg.as_ref(), format) {
+        let output = Output { queue: queue_out, producer: producer_thread.clone(), meters: meters.clone(), started: false };
+        let built = match format {
+            cpal::SampleFormat::F32 => build::<f32>(device, cfg, output),
+            cpal::SampleFormat::I16 => build::<i16>(device, cfg, output),
+            cpal::SampleFormat::U16 => build::<u16>(device, cfg, output),
+            cpal::SampleFormat::I32 => build::<i32>(device, cfg, output),
+            other => {
+                status = Some(format!("La salida de audio usa un formato que no manejo ({other:?})."));
+                Err(cpal::BuildStreamError::StreamConfigNotSupported)
+            }
+        };
+        match built {
+            Ok(s) => match s.play() {
+                Ok(()) => {
+                    audio_name = device.name().unwrap_or_else(|_| "salida por defecto".into());
+                    channels = cfg.channels;
+                    stream = Some(s);
+                }
+                Err(e) => status = Some(format!("No pude arrancar el audio: {e}")),
+            },
+            Err(e) => {
+                if status.is_none() {
+                    status = Some(format!("No pude abrir la salida de audio: {e}"));
+                }
+            }
+        }
+    }
+    Running { tx, producer: producer_thread, worker, meters, stream, params, sr, threads, audio_name, channels, status }
+}
+
+fn stop(r: Running) {
+    r.meters.quit.store(true, Ordering::Relaxed);
+    r.producer.unpark();
+    drop(r.stream);
+    let _ = r.worker.join();
+}
+
+// ------------------------------------------------------------------ ventana
+
+/// id de las notas del teclado de pantalla: el "canal 16" (así id % 128 = nota).
+const SCREEN_ID: i32 = 16 * 128;
+
+struct Gui {
+    model: orfeon_ui::Model,
+    tx: Sender<Msg>,
+    producer: std::thread::Thread,
+    meters: Arc<Meters>,
+    standalone: orfeon_ui::Standalone,
+    midi: Option<midir::MidiInputConnection<()>>,
+    sr: f64,
+    events: Vec<orfeon_ui::Event>,
+}
+
+impl Gui {
+    fn send(&self, m: Msg) {
+        let _ = self.tx.send(m);
+        self.producer.unpark();
+    }
+
+    fn frame(&mut self, ctx: &orfeon_ui::egui::Context) {
+        let mut tel = orfeon_ui::Telemetry::default();
+        tel.load = self.meters.load.load(Ordering::Relaxed) as f32 / 1000.0;
+        tel.voices = self.meters.voices.load(Ordering::Relaxed);
+        tel.underruns = Some(self.meters.underruns.load(Ordering::Relaxed));
+        tel.threads = self.meters.threads.load(Ordering::Relaxed);
+        for (t, a) in tel.levels.iter_mut().zip(self.meters.levels.iter()) {
+            *t = f32::from_bits(a.load(Ordering::Relaxed));
+        }
+        for (t, a) in tel.held.iter_mut().zip(self.meters.held.iter()) {
+            *t = a.load(Ordering::Relaxed);
+        }
+        self.standalone.latency_ms = (self.meters.latency.load(Ordering::Relaxed) as f64 * 1000.0 / self.sr).round() as u32;
+        self.events.clear();
+        let mut events = std::mem::take(&mut self.events);
+        let changed = orfeon_ui::show(ctx, &mut self.model, &tel, Some(&self.standalone), &mut events);
+        if changed {
+            self.send(Msg::Params(self.model.params));
+        }
+        for e in events.drain(..) {
+            match e {
+                orfeon_ui::Event::NoteOn(k, v) => self.send(Msg::On(SCREEN_ID + k as i32, k, v as f64)),
+                orfeon_ui::Event::NoteOff(k) => self.send(Msg::Off(SCREEN_ID + k as i32)),
+                orfeon_ui::Event::AllOff => self.send(Msg::AllOff),
+                orfeon_ui::Event::Threads(n) => {
+                    self.meters.threads.store(n, Ordering::Relaxed);
+                    self.send(Msg::Threads(n));
+                }
+                orfeon_ui::Event::Latency(ms) => self.meters.latency.store((self.sr * ms as f64 / 1000.0) as usize, Ordering::Relaxed),
+                orfeon_ui::Event::Midi(i) => {
+                    self.midi = None;
+                    match midi_connect(i, self.tx.clone(), self.producer.clone()) {
+                        Ok((c, _)) => {
+                            self.midi = Some(c);
+                            self.standalone.midi_selected = Some(i);
+                            self.standalone.status = None;
+                        }
+                        Err(e) => {
+                            self.standalone.midi_selected = None;
+                            self.standalone.status = Some(format!("MIDI: {e}"));
+                        }
+                    }
+                }
+            }
+        }
+        self.events = events;
+    }
+}
+
+/// Formato de OpenGL. ORFEON_GL_SIMPLE=1 pide uno sin alfa ni sRGB: lo necesitan algunas
+/// pantallas virtuales y escritorios remotos (con el de siempre, la ventana no abre).
+fn gl_config() -> baseview::gl::GlConfig {
+    let mut c = baseview::gl::GlConfig::default();
+    if std::env::var_os("ORFEON_GL_SIMPLE").is_some() {
+        c.alpha_bits = 0;
+        c.srgb = false;
+        c.stencil_bits = 0;
+    }
+    c
+}
+
+fn run_gui() {
+    let r = start(false);
+    let mut standalone = orfeon_ui::Standalone {
+        audio: r.audio_name.clone(),
+        sample_rate: r.sr as u32,
+        latency_ms: DEFAULT_LATENCY_MS,
+        midi_ports: midi_ports(),
+        midi_selected: None,
+        status: r.status.clone(),
+    };
+    let mut midi = None;
+    if !standalone.midi_ports.is_empty() {
+        if let Ok((c, _)) = midi_connect(0, r.tx.clone(), r.producer.clone()) {
+            midi = Some(c);
+            standalone.midi_selected = Some(0);
+        }
+    }
+    let _ = r.channels;
+    let gui = Gui { model: orfeon_ui::Model::new(r.params, Some(0)), tx: r.tx.clone(), producer: r.producer.clone(), meters: r.meters.clone(), standalone, midi, sr: r.sr, events: Vec::new() };
+    let settings = baseview::WindowOpenOptions {
+        title: "Orfeón".to_string(),
+        size: baseview::Size::new(orfeon_ui::WIDTH as f64, orfeon_ui::HEIGHT as f64),
+        scale: baseview::WindowScalePolicy::SystemScaleFactor,
+        gl_config: Some(gl_config()),
+    };
+    egui_baseview::EguiWindow::open_blocking(
+        settings,
+        egui_baseview::GraphicsConfig::default(),
+        gui,
+        |ctx, _queue, _gui: &mut Gui| orfeon_ui::theme::apply(ctx),
+        |ctx, _queue, gui: &mut Gui| gui.frame(ctx),
+    );
+    stop(r);
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--consola") {
+        attach_console();
+        run_console();
+    } else {
+        run_gui();
+    }
+}
+
+fn run_console() {
+    println!("Orfeón {} — coro de cantantes modelados físicamente", env!("CARGO_PKG_VERSION"));
+    println!("Motor de voz: CHIMERA (Jameson Hodge, MIT). Software libre, GPL-3.0-or-later.\n");
+    let r = start(true);
+    if let Some(msg) = &r.status {
+        eprintln!("{msg}");
+        stop(r);
+        wait_and_exit(1);
+    }
+    println!("audio:  {} — {} Hz, {} canales, colchón {DEFAULT_LATENCY_MS} ms", r.audio_name, r.sr as u32, r.channels);
+    let (tx, meters, sr, producer_thread) = (r.tx.clone(), r.meters.clone(), r.sr, r.producer.clone());
+    let mut params = r.params;
+    let mut threads = r.threads;
     let notify = |tx: &Sender<Msg>, m: Msg| {
         let _ = tx.send(m);
         producer_thread.unpark();
     };
-
-    let output = Output { queue: queue_out, producer: producer_thread.clone(), meters: meters.clone(), started: false };
-    let stream = match format {
-        cpal::SampleFormat::F32 => build::<f32>(&device, &cfg, output),
-        cpal::SampleFormat::I16 => build::<i16>(&device, &cfg, output),
-        cpal::SampleFormat::U16 => build::<u16>(&device, &cfg, output),
-        cpal::SampleFormat::I32 => build::<i32>(&device, &cfg, output),
-        other => {
-            eprintln!("La salida de audio usa un formato que no manejo ({other:?}).");
-            wait_and_exit(1);
-        }
-    };
-    let stream = match stream {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("No pude abrir la salida de audio: {e}");
-            wait_and_exit(1);
-        }
-    };
-    if let Err(e) = stream.play() {
-        eprintln!("No pude arrancar el audio: {e}");
-        wait_and_exit(1);
-    }
-    println!("audio:  {} — {} Hz, {} canales, colchón {DEFAULT_LATENCY_MS} ms", device.name().unwrap_or_else(|_| "salida por defecto".into()), sr as u32, cfg.channels);
-
     // ---- MIDI: la primera entrada, si hay ----
     let mut midi: Option<midir::MidiInputConnection<()>> = None;
     let ports = midi_ports();
@@ -454,11 +685,8 @@ fn main() {
             }
         }
     }
-    meters.quit.store(true, Ordering::Relaxed);
-    producer_thread.unpark();
     drop(midi);
-    drop(stream);
-    let _ = worker.join();
+    stop(r);
 }
 
 /// En Windows la ventana se cierra sola al terminar: deja leer el error antes.

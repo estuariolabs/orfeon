@@ -316,3 +316,36 @@ fn expresion_por_nota_y_entradas_hostiles() {
     let (l, _) = render(&mut c, 0.5);
     assert!(finite(&l) && rms(&l[12000..]) > 0.002);
 }
+
+#[test]
+fn editar_la_cara_de_un_cantante_no_corta_a_los_demas() {
+    let mut c = Choir::new(FS, 1);
+    let base = ChoirParams { singers: 4, max_voices: 4, ..dry() };
+    c.set_params(base);
+    c.note_on(1, 48, 0.7);
+    c.note_on(2, 60, 0.7);
+    render(&mut c, 0.6);
+    let before: Vec<_> = (0..4).map(|i| c.singer(i).unwrap()).collect();
+    // la cara del cantante 3 (que no está cantando) cambia a mano
+    let mut p = base;
+    p.custom[3] = Some(Face { neck: 1.0, size: 1.0, jaw: 0.5, lips: -0.5, nose: 0.8, age: 0.6 });
+    c.set_params(p);
+    assert_eq!(c.sounding(), 2, "las dos notas siguen después de editar otra cara");
+    let (l, _) = render(&mut c, 0.3);
+    assert!(rms(&l) > 0.01, "el coro se calló al editar una cara");
+    assert_eq!(c.singer(0).unwrap(), before[0]);
+    assert_eq!(c.singer(1).unwrap(), before[1]);
+    let s3 = c.singer(3).unwrap();
+    assert!(s3 != before[3] && s3.body.pharynx > before[3].body.pharynx, "la cara nueva no cambió el cuerpo");
+    // misma persona: sólo cambia la anatomía, no la afinación ni el lugar
+    assert_eq!((s3.detune, s3.pan), (before[3].detune, before[3].pan));
+    // lo que dibuja la interfaz es lo mismo que suena
+    assert_eq!(p.singer(3), s3);
+    // volver a "sin editar" devuelve al cantante original
+    c.set_params(base);
+    assert_eq!(c.singer(3).unwrap(), before[3]);
+    // nivel por cantante: los que cantan tienen nivel, los otros no
+    render(&mut c, 0.2);
+    let lv = c.levels();
+    assert!(lv.iter().filter(|x| **x > 1e-3).count() >= 2);
+}

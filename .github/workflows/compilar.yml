@@ -1,0 +1,131 @@
+# Compila Orfeón para macOS (universal: Intel y Apple Silicon), Windows y Linux.
+# Cada corrida deja los paquetes en "Artifacts". Al subir una etiqueta v*, además publica
+# una versión (Releases) con los tres paquetes.
+name: Compilar
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Tests del núcleo
+        run: cargo test --release -p orfeon-core
+      - name: Plugin CLAP y VST3 (universal)
+        run: cargo xtask bundle-universal orfeon-plugin --release
+      - name: App y renderizador (universal)
+        run: |
+          set -e
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --target "$t" -p orfeon-app -p orfeon-cli
+          done
+          mkdir -p dist
+          lipo -create -output dist/orfeon-app target/aarch64-apple-darwin/release/orfeon-app target/x86_64-apple-darwin/release/orfeon-app
+          lipo -create -output dist/orfeon-render target/aarch64-apple-darwin/release/orfeon target/x86_64-apple-darwin/release/orfeon
+      - name: Paquete
+        run: |
+          set -e
+          V=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          P="Orfeon-$V-macos"
+          mkdir -p "$P/plugin"
+          scripts/macos-app.sh dist/orfeon-app "$P/Orfeon.app" "$V"
+          cp dist/orfeon-render "$P/orfeon-render"
+          cp -R target/bundled/Orfeon.clap target/bundled/Orfeon.vst3 "$P/plugin/"
+          # firma ad hoc: sin ella macOS no abre binarios en Apple Silicon
+          codesign --force --deep -s - "$P/Orfeon.app"
+          codesign --force -s - "$P/orfeon-render"
+          codesign --force --deep -s - "$P/plugin/Orfeon.clap" "$P/plugin/Orfeon.vst3"
+          cp LICENSE "$P/LICENSE.txt"; cp NOTICE.md "$P/NOTICE.txt"; cp docs/LEEME-mac.txt "$P/LEEME.txt"
+          ditto -c -k --keepParent "$P" "$P.zip"
+          echo "PAQUETE=$P.zip" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orfeon-macos
+          path: ${{ env.PAQUETE }}
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Tests del núcleo
+        run: cargo test --release -p orfeon-core
+      - name: Compilar
+        run: |
+          cargo build --release -p orfeon-app -p orfeon-cli
+          cargo xtask bundle orfeon-plugin --release
+      - name: Paquete
+        shell: pwsh
+        run: |
+          $V = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches.Groups[1].Value
+          $P = "Orfeon-$V-windows"
+          New-Item -ItemType Directory -Force "$P/plugin" | Out-Null
+          Copy-Item target/release/orfeon-app.exe "$P/Orfeon.exe"
+          Copy-Item target/release/orfeon.exe "$P/orfeon-render.exe"
+          Copy-Item -Recurse target/bundled/Orfeon.clap, target/bundled/Orfeon.vst3 "$P/plugin/"
+          Copy-Item "docs/Orfeon (modo seguro).bat" "$P/"
+          Copy-Item LICENSE "$P/LICENSE.txt"; Copy-Item NOTICE.md "$P/NOTICE.txt"; Copy-Item docs/LEEME-windows.txt "$P/LEEME.txt"
+          Compress-Archive -Path $P -DestinationPath "$P.zip"
+          "PAQUETE=$P.zip" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orfeon-windows
+          path: ${{ env.PAQUETE }}
+
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Bibliotecas de audio y ventanas
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config libx11-dev libx11-xcb-dev libxcb1-dev libxcb-icccm4-dev libxcb-dri2-0-dev libxcursor-dev libgl1-mesa-dev
+      - name: Tests
+        run: cargo test --release
+      - name: Compilar
+        run: |
+          cargo build --release -p orfeon-app -p orfeon-cli
+          cargo xtask bundle orfeon-plugin --release
+      - name: Paquete
+        run: |
+          set -e
+          V=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          P="Orfeon-$V-linux"
+          mkdir -p "$P/plugin"
+          cp target/release/orfeon-app "$P/orfeon"
+          cp target/release/orfeon "$P/orfeon-render"
+          cp -R target/bundled/Orfeon.clap target/bundled/Orfeon.vst3 "$P/plugin/"
+          cp LICENSE "$P/LICENSE.txt"; cp NOTICE.md "$P/NOTICE.txt"
+          tar czf "$P.tar.gz" "$P"
+          echo "PAQUETE=$P.tar.gz" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orfeon-linux
+          path: ${{ env.PAQUETE }}
+
+  publicar:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: paquetes
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: paquetes/*

@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/orfeon-core", "crates/orfeon-cli", "crates/orfeon-app", "crates/orfeon-plugin", "xtask"]
+members = ["crates/orfeon-core", "crates/orfeon-cli", "crates/orfeon-ui", "crates/orfeon-app", "crates/orfeon-plugin", "xtask"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 

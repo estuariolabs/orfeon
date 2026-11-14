@@ -1,0 +1,11 @@
+[package]
+name = "orfeon-ui"
+description = "Interfaz de Orfeón (egui): la misma para el plugin y la app independiente"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+orfeon-core = { path = "../orfeon-core" }
+# la misma versión que fija egui-baseview (plugin y app usan esa ventana)
+egui = { version = "0.31", default-features = false }

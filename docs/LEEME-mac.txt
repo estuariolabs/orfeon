@@ -1,0 +1,33 @@
+ORFEÓN 0.2.0 — coro de cantantes modelados físicamente (macOS 11 o más nuevo,
+Intel y Apple Silicon)
+================================================================================
+
+Software libre (GPL-3.0-or-later). Motor de voz: CHIMERA, de Jameson Hodge (MIT).
+
+
+ANTES DE ABRIR: el programa no está firmado por Apple. La primera vez:
+  click derecho (o Control+click) sobre Orfeon.app -> Abrir -> Abrir.
+Si macOS dice que "está dañado" o no deja abrirlo, en Terminal:
+  xattr -dr com.apple.quarantine /ruta/a/Orfeon-0.2.0-macos
+
+
+1. LA APP: Orfeon.app
+---------------------
+Arrastrala a Aplicaciones y abrila. Tarda unos segundos: mide cuántas voces
+aguanta la Mac. Se toca con el teclado de la pantalla o un teclado MIDI.
+Si el sonido se entrecorta: pestaña Ajustes (colchón de audio, voces a la vez,
+calidad Eco).
+
+
+2. PLUGIN (VST3 y CLAP)
+-----------------------
+  VST3:  copiar  plugin/Orfeon.vst3  a  ~/Library/Audio/Plug-Ins/VST3/
+  CLAP:  copiar  plugin/Orfeon.clap  a  ~/Library/Audio/Plug-Ins/CLAP/
+Si el DAW no lo carga, corré el comando xattr de arriba sobre esos archivos.
+No hay versión Audio Unit (AU): Logic Pro y GarageBand no lo ven. Sirve en
+Ableton Live, Reaper, Bitwig, Cubase, Studio One y otros con VST3 o CLAP.
+
+
+3. RENDIR A WAV: orfeon-render
+------------------------------
+En Terminal, en esta carpeta:  ./orfeon-render render coro.wav --preset 1

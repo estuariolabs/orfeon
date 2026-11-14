@@ -1,0 +1,51 @@
+ORFEÓN 0.2.0 — coro de cantantes modelados físicamente (Windows 10/11, 64 bits)
+================================================================================
+
+Software libre (GPL-3.0-or-later). Motor de voz: CHIMERA, de Jameson Hodge (MIT).
+No usa samples: cada cantante es una simulación de pulmones, cuerdas vocales,
+garganta, boca y nariz.
+
+
+1. LA APP: Orfeon.exe
+---------------------
+Doble clic. Tarda unos segundos en abrir: mide cuántas voces aguanta tu PC.
+
+Windows puede mostrar "Windows protegió su PC" porque el programa no está
+firmado: "Más información" -> "Ejecutar de todas formas".
+
+Si la ventana no abre (placas de video viejas, escritorio remoto, máquinas
+virtuales): usá "Orfeon (modo seguro).bat".
+
+La ventana:
+  - Arriba: programas (36), modo Coro / Tutti / Solo, carga de CPU, volumen.
+  - Izquierda: el elenco. Cada cara es un cantante; se ilumina cuando canta.
+    Click en una cara para editarla.
+  - Pestañas: Cantante (rostro y cuerpo de cada uno y del coro entero),
+    Voz (estilo y expresión), Vocal (carta de vocales: arrastrá el punto),
+    Escenario y sala, Ajustes (rendimiento, audio y teclado MIDI).
+  - Abajo: teclado. Se toca con el mouse o con un teclado MIDI conectado.
+
+Si el sonido se entrecorta: pestaña Ajustes. Subí el "colchón de audio",
+bajá "voces a la vez" o pasá a calidad Eco. Con notebook, enchufada.
+
+Uso por comandos, sin ventana:  Orfeon.exe --consola  (desde cmd o PowerShell).
+
+
+2. PLUGIN PARA DAW (VST3 y CLAP)
+--------------------------------
+  VST3:  copiar la carpeta  plugin\Orfeon.vst3  a  C:\Program Files\Common Files\VST3\
+  CLAP:  copiar  plugin\Orfeon.clap  a  C:\Program Files\Common Files\CLAP\
+Volvé a escanear plugins en el DAW. Es un instrumento: "Orfeon".
+Tiene la misma ventana que la app. Los controles se pueden automatizar, y las
+caras editadas se guardan con el proyecto.
+
+
+3. RENDIR A WAV: orfeon-render.exe
+----------------------------------
+Desde cmd o PowerShell en esta carpeta:
+    .\orfeon-render.exe presets
+    .\orfeon-render.exe render coro.wav --preset 1
+    .\orfeon-render.exe bench
+
+
+Código fuente: codigo-fuente.zip (GPL-3.0). Créditos: NOTICE.txt.

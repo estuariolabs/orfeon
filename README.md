@@ -4,130 +4,105 @@ Coro de cantantes modelados físicamente. Sin samples y sin modelos neuronales: 
 es una simulación propia de pulmones, cuerdas vocales, garganta, boca y nariz, con su cuerpo,
 su rostro y su manera de cantar.
 
+![Orfeón](docs/captura.png)
+
 Libre (GPL-3.0-or-later). El motor de voz es [CHIMERA](https://github.com/jamesondh/chimera-vocal-synth)
 de Jameson Hodge (MIT), usado como dependencia sin modificar. Ver [`NOTICE.md`](NOTICE.md).
 
-## Estado
+Se usa como **app independiente** (Windows, macOS, Linux) o como **plugin VST3 / CLAP**, con
+la misma ventana en los dos.
+
+## Estado (0.2.0)
 
 | Parte | Estado |
 |---|---|
-| Núcleo (`crates/orfeon-core`) | Compila. 12 tests pasan. |
-| Línea de comandos (`crates/orfeon-cli`) | Compila y rinde audio. Es la forma verificada de escucharlo. |
-| App independiente (`crates/orfeon-app`) | Compila para Windows y Linux. Probada bajo Wine con una placa de sonido virtual: abre el audio, canta y responde a los comandos. **No se probó con parlantes reales ni con un teclado MIDI.** |
-| Plugin CLAP / VST3 (`crates/orfeon-plugin`) | Compila y se empaqueta para Linux y Windows. **Nunca se cargó en un DAW.** |
-| Sonido | Nadie lo escuchó todavía: estilos, programas y niveles se eligieron a mano y por medición. |
+| Núcleo (`crates/orfeon-core`) | 16 tests pasan. |
+| Interfaz (`crates/orfeon-ui`) | La misma en la app y en el plugin. Probada abriendo la app en Linux y la versión de Windows bajo Wine. |
+| App (`crates/orfeon-app`) | Linux y Windows compilados y probados (Windows bajo Wine, con una salida de audio virtual). macOS: se compila en GitHub Actions; no se probó en una Mac. |
+| Plugin VST3 / CLAP (`crates/orfeon-plugin`) | Compila para Linux y Windows y pasa el chequeo de compilación para macOS. **Nunca se cargó en un DAW.** |
+| Render por línea de comandos (`crates/orfeon-cli`) | Funciona; el `.exe` bajo Wine da el mismo audio byte a byte que en Linux. |
+| Sonido | Ajustado por medición; falta escucharlo y afinarlo a oído. |
 
-## Qué hace
+## La ventana
 
-- **Hasta 64 cantantes**, cada uno con su propia simulación de voz.
-- **Rostro y cuerpo**: cuello, tamaño, mandíbula, labios, nariz y edad cambian la anatomía que
-  se simula. Hay un rostro común y una "variedad" que aparta a cada cantante de él.
-- **Siete tipos de voz** (bajo, barítono, tenor, contralto, mezzo, soprano, niño) y **ocho
-  conjuntos** (mixto, femenino, masculino, niños y cada cuerda sola).
-- **Tres modos**: *Coro* (cada nota va al cantante siguiente, prefiriendo a quien le quede en
-  registro), *Tutti* (todos cantan la última nota, cada uno en su octava) y *Solo* (un
-  cantante, ligado).
-- **Ocho estilos**: Clásico, Antiguo, Pop, Gospel, Folk, Susurro, Belting, Rasgado.
-- **Carta de vocales** en dos ejes, con movimiento automático y diferencias entre cantantes.
-- **Cada cantante por su cuenta**: afinación que deriva, vibrato propio, entrada más o menos
-  tardía, intensidad que se balancea.
-- **Escenario, sala y micrófono**: lugar de cada cantante (cuerdas de izquierda a derecha,
-  graves atrás), cinco salas y distancia del micrófono.
-- **Expresión por nota** (MPE): afinación, presión y brillo de cada nota.
-- **36 programas** de fábrica.
+- **Barra de arriba**: 36 programas (flechas y lista), modo **Coro** (una voz por nota),
+  **Tutti** (todos la misma nota, cada uno en su octava) o **Solo** (un cantante, ligado),
+  voces sonando, carga de CPU, volumen.
+- **Elenco** (izquierda): una cara por cantante, dibujada a partir de su rostro y su cuerpo. Se
+  ilumina y abre la boca, con la forma de la vocal, cuando canta. Conjunto, cantidad (1 a 64),
+  "otro elenco". Click en una cara para editarla.
+- **Cantante**: retrato grande y seis controles de **ese** cantante: cuello (faringe), tamaño,
+  mandíbula (lengua), labios, nariz (resonancia nasal) y edad. Abajo, el rostro común de todo el
+  coro y cuánto varía cada uno.
+- **Voz**: ocho estilos (Clásico, Antiguo, Pop, Gospel, Folk, Susurro, Belting, Rasgado),
+  vibrato, aire, brillo y humanizar.
+- **Vocal**: carta de vocales (la de CHIMERA) con un punto para arrastrar, botones A E I O U y
+  movimiento automático.
+- **Escenario y sala**: cada cantante en su lugar (cuerdas de izquierda a derecha, graves
+  atrás; click para elegirlo), la sala de fondo y el micrófono. Cinco salas, cantidad de sala,
+  distancia del micrófono, ancho y fondo.
+- **Ajustes**: calidad Alta o Eco, tope de voces a la vez, hilos. En la app, además, colchón de
+  audio, cortes y teclado MIDI.
+- **Teclado** de C2 a C7, con el registro de cada tipo de voz marcado arriba. Se toca con el
+  mouse, con un teclado MIDI o desde el DAW.
+
+En el plugin cada control es un parámetro del DAW (automatizable). Las caras editadas a mano y
+el programa elegido se guardan con el proyecto. Editar la cara de un cantante reconstruye sólo
+a ese cantante: los demás siguen sonando.
 
 ## Probarlo
 
-Hace falta [Rust](https://rustup.rs) (probado con 1.97).
+### Paquetes
 
-### 1. Tests y primera escucha (lo verificado)
+`.github/workflows/compilar.yml` compila en GitHub Actions, en cada subida:
+
+- **macOS** (universal, Intel y Apple Silicon): `Orfeon.app`, plugin VST3 y CLAP, renderizador.
+  Firma ad hoc, sin notarizar: la primera vez se abre con click derecho → Abrir.
+- **Windows**: `Orfeon.exe`, plugin, renderizador y un lanzador de modo seguro.
+- **Linux**: app, plugin y renderizador.
+
+Quedan en la pestaña *Actions* de cada corrida ("Artifacts"). Al subir una etiqueta `v*`
+(por ejemplo `git tag v0.2.0 && git push --tags`) además se publica una versión en *Releases*.
+macOS sólo se puede compilar en una Mac (hace falta el SDK de Apple), por eso va por Actions.
+
+Las guías de cada paquete están en `docs/LEEME-windows.txt` y `docs/LEEME-mac.txt`.
+
+### Desde el código
+
+Hace falta [Rust](https://rustup.rs). En Linux, además, las bibliotecas de audio, X11 y
+OpenGL (la lista está en el workflow).
 
 ```sh
-cargo test --release                 # 12 tests, unos 10 s
-cargo run --release -p orfeon-cli -- presets
+cargo test --release                                  # tests
+cargo run --release -p orfeon-app                     # la app con ventana
+cargo run --release -p orfeon-app -- --consola        # la app por comandos de texto
+cargo xtask bundle orfeon-plugin --release            # plugin: target/bundled/Orfeon.{clap,vst3}
 cargo run --release -p orfeon-cli -- render coro.wav --preset 1
-cargo run --release -p orfeon-cli -- render vocales.wav --preset 1 --demo vocales
-cargo run --release -p orfeon-cli -- render solo.wav --preset 29 --demo melodia
-cargo run --release -p orfeon-cli -- singers --preset 2     # quiénes forman el coro
+cargo run --release -p orfeon-cli -- bench            # cuántas voces aguanta la máquina
 ```
 
-Para rendir tu propia música, un archivo de texto con una nota por línea
-(`inicio duración nota [velocidad]`, en segundos y número MIDI):
+Si la ventana no abre (máquinas virtuales, escritorio remoto, OpenGL viejo): variable de
+entorno `ORFEON_GL_SIMPLE=1` (en Windows, el lanzador "modo seguro").
 
-```
-# acorde de do mayor y una nota arriba
-0.0 2.0 48
-0.0 2.0 55
-0.0 2.0 64
-1.0 1.0 72 0.9
-```
+Para rendir música propia sin DAW, un archivo de texto con una nota por línea
+(`inicio duración nota [velocidad]`, en segundos y número MIDI) y
+`orfeon-cli render salida.wav --score notas.txt --preset 7`.
+
+### Compilar para Windows desde Linux
+
+Con `mingw-w64` y `rustup target add x86_64-pc-windows-gnu`:
 
 ```sh
-cargo run --release -p orfeon-cli -- render salida.wav --score notas.txt --preset 7
+cargo build --release --target x86_64-pc-windows-gnu -p orfeon-app -p orfeon-cli
+cargo xtask bundle orfeon-plugin --release --target x86_64-pc-windows-gnu
 ```
 
-Opciones: `--mode coro|tutti|solo`, `--singers N`, `--style 1..8`, `--room 1..5`,
-`--vowel a|e|i|o|u`, `--voices N`, `--eco`, `--threads N`, `--tail SEG`.
-
-### 2. La app independiente (sin DAW)
-
-```sh
-cargo run --release -p orfeon-app
-```
-
-Abre la salida de audio por defecto y el primer teclado MIDI que encuentre. Se toca con el
-teclado MIDI o con comandos (`n 48 55 64 72`, `demo`, `p catedral`, `ayuda`).
-
-Al arrancar mide cuántas voces aguanta la máquina y fija ese tope (si en calidad Alta entran
-menos de 4, pasa a Eco). El coro se calcula en un hilo propio con prioridad de audio y deja
-un colchón de 40 ms; la placa de sonido sólo copia de ese colchón. `info` muestra la carga y
-los cortes; si hay cortes, `latencia 80` agranda el colchón y `voces N` baja el tope. En Linux hace
-falta `libasound2-dev` y `pkg-config` para compilarla.
-
-### 3. Cuántas voces aguanta tu máquina
-
-```sh
-cargo run --release -p orfeon-cli -- bench
-cargo run --release -p orfeon-cli -- bench --eco
-```
-
-Mide la carga para 1, 2, 4, 8, 16, 32 y 64 voces. Por debajo de ~70 % se puede tocar en vivo.
-Usá el resultado para fijar "Voces a la vez" en el plugin.
-
-### 4. El plugin
-
-```sh
-cargo xtask bundle orfeon-plugin --release
-```
-
-Deja `target/bundled/Orfeon.clap` y `Orfeon.vst3` para el sistema donde lo compiles (hay que
-compilarlo en Windows para Windows, en macOS para macOS). Copialos a la carpeta de plugins:
-
-| Sistema | CLAP | VST3 |
-|---|---|---|
-| Windows | `C:\Program Files\Common Files\CLAP` | `C:\Program Files\Common Files\VST3` |
-| macOS | `~/Library/Audio/Plug-Ins/CLAP` | `~/Library/Audio/Plug-Ins/VST3` |
-| Linux | `~/.clap` | `~/.vst3` |
-
-Qué probar, en este orden:
-
-1. Que el DAW lo liste como instrumento y cargue sin errores.
-2. Tocar una nota: tiene que sonar una "a" cantada.
-3. Tocar un acorde de cuatro notas: cuatro cantantes distintos, repartidos en el estéreo.
-4. Mover "Programa" de `Manual` a cualquier otro: cambia el coro entero.
-5. Con "Programa" en `Manual`: mover Modo, Estilo, las dos perillas de Vocal y Sala.
-6. Mirar el medidor de CPU del DAW con 4 y 8 notas. Si se entrecorta: bajar "Voces a la vez",
-   poner "Calidad" en `Eco`, o subir el tamaño de buffer del DAW.
-
-No tiene interfaz propia: los controles aparecen en el editor genérico del DAW. La
-compilación y el empaquetado se probaron sólo en Linux; cargarlo y tocarlo en un DAW no se
-probó en ningún sistema. Todo lo que habla con el DAW está en
-`crates/orfeon-plugin/src/lib.rs`.
+Salen enlazados estáticamente: no necesitan DLL aparte.
 
 ## Cuánto cuesta
 
 Cada cantante que suena es una simulación completa. Medido en una máquina virtual de 4
-núcleos (la tuya probablemente sea más rápida); 100 % = tiempo real:
+núcleos; 100 % = tiempo real:
 
 | Voces a la vez | Alta, 4 hilos | Eco, 4 hilos | Alta, 1 hilo |
 |---|---|---|---|
@@ -135,81 +110,73 @@ núcleos (la tuya probablemente sea más rápida); 100 % = tiempo real:
 | 4 | 32 % | 20 % | 91 % |
 | 8 | 67 % | 38 % | 216 % |
 | 16 | 124 % | 58 % | 416 % |
-| 32 | 222 % | 113 % | — |
-| 64 | 427 % | 230 % | — |
 
-- Se pueden **definir** 64 cantantes, pero en vivo suenan a la vez los que la máquina
-  aguante. "Voces a la vez" es ese tope; al pasarlo, la nota nueva toma el lugar de la más vieja.
-- Fuera de tiempo real no hay tope: la línea de comandos y el bounce offline del DAW rinden
+- Se pueden **definir** 64 cantantes; en vivo suenan a la vez los que la máquina aguante. La
+  app lo mide al abrir y fija el tope (si en Alta entran menos de 4, pasa a Eco). Al pasarlo,
+  la nota nueva toma el lugar de la más vieja.
+- Fuera de tiempo real no hay tope: el renderizador y el bounce offline del DAW rinden
   cualquier cantidad.
-- **Eco** corre el motor a ~30 kHz y remuestrea: cuesta más o menos la mitad y pierde los
-  agudos por encima de 15 kHz.
+- **Eco** corre el motor a ~30 kHz y remuestrea: cuesta la mitad y pierde lo que está por
+  encima de 15 kHz.
+- En la app el coro se calcula en un hilo propio con prioridad de audio y deja un colchón
+  (40 ms por defecto); la placa de sonido sólo copia. Así las demoras del sistema no se oyen.
 
 ## Diferencias con los coros modelados comerciales
 
 Orfeón apunta a las mismas funciones que los instrumentos comerciales de coro por modelado
-físico (hasta 64 cantantes con rostro y cuerpo, modos coro/tutti/solo, estilos, sala y
-micrófonos, carta de vocales, 36 programas). No usa código, programas ni nombres de ninguno.
-Lo que hoy **no** iguala:
+físico (muchos cantantes con rostro y cuerpo propios, coro/tutti/solo, estilos, sala y
+micrófono, carta de vocales, programas). No usa su código, sus programas, sus gráficos ni sus
+nombres. Lo que hoy **no** iguala:
 
-- **Voces simultáneas en vivo.** El motor de CHIMERA es mucho más pesado por voz: 8 a 16
-  voces en una máquina común, no 64.
-- **Interfaz.** No hay ventana propia ni caras dibujadas; sólo los controles del DAW.
-- **Programas.** En el plugin se eligen con el control "Programa"; no aparecen en el
-  navegador de presets del DAW.
-- **Micrófonos.** Hay una distancia de micrófono, no modelos de micrófono ni varias tomas.
-- **MPE.** Recibe expresiones por nota de CLAP y la rueda de afinación; no se probó con un
-  controlador MPE.
+- **Voces simultáneas en vivo.** El motor de CHIMERA es pesado por voz: 8 a 16 voces en una
+  máquina común, no 64.
+- **Retratos.** Las caras y el escenario son dibujos planos, no 3D.
+- **Audio Unit.** No hay versión AU (Logic Pro, GarageBand): nih-plug no la genera.
+- **Programas en el DAW.** Se eligen en la ventana, no desde el navegador de presets del DAW.
+- **Micrófonos.** Hay distancia de micrófono, no modelos ni varias tomas.
+- **MPE.** Recibe afinación, presión y brillo por nota (CLAP) y la rueda de afinación; no se
+  probó con un controlador MPE.
 - **Ajuste a oído.** Estilos y programas no fueron comparados contra grabaciones.
 
-Lo que podría sumar más adelante y los comerciales no anuncian: CHIMERA ya canta consonantes
-y letra (inglés y coreano). Orfeón todavía no lo expone.
+CHIMERA ya canta consonantes y letra (inglés y coreano); Orfeón todavía no lo usa.
 
 ## Cómo está hecho
 
 ```
-crates/orfeon-core/     el coro (sin E/S)
+crates/orfeon-core/     el coro, sin E/S
   singer.rs             tipo de voz, rostro -> anatomía, rasgos personales
   vowel.rs              carta de vocales -> postura de la boca
   style.rs              los ocho estilos
   choir.rs              reparto de notas, dirección de cada voz, hilos, escenario
   room.rs               reverberación
   preset.rs             los 36 programas
+  console.rs            comandos de texto de la app (con tests)
   tests/choir.rs        tests
+crates/orfeon-ui/       la ventana (egui), compartida por app y plugin
+  face.rs               retrato de cada cantante a partir de su rostro
+  widgets.rs            carta de vocales, escenario, teclado
+crates/orfeon-app/      app: ventana, audio en tiempo real, MIDI
+crates/orfeon-plugin/   plugin VST3 / CLAP (nih-plug)
 crates/orfeon-cli/      rinde WAV, lista programas, mide la carga
-crates/orfeon-app/      app independiente: audio en tiempo real, MIDI y comandos
-  (los comandos se interpretan en orfeon-core/src/console.rs, con sus tests)
-crates/orfeon-plugin/   plugin CLAP/VST3 (nih-plug)
 xtask/                  empaquetador del plugin (`cargo xtask bundle`)
+scripts/macos-app.sh    arma Orfeon.app
+.github/workflows/      compilación para macOS, Windows y Linux
 ```
 
-- **Del rostro a la voz.** CHIMERA simula un tracto a partir de cuatro medidas (tamaño, largo
+- **Del rostro a la voz.** CHIMERA simula el tracto a partir de cuatro medidas (tamaño, largo
   de faringe, lengua, labios). Cada tipo de voz parte de una mezcla de sus tres cuerpos
-  calibrados (hombre, mujer, niño); el rostro mueve esas medidas dentro de límites que el
-  motor aguanta. La nariz abre un poco el velo. La edad acerca el cuerpo al de un niño o
-  agrega aspereza y aire.
-- **Qué controla Orfeón por voz**, en cada tramo de 128 muestras: altura (con desafinación,
-  deriva, ataque desde abajo y expresión por nota), presión de pulmones, tensión, aire,
-  brillo, aspereza, vibrato con entrada retardada, postura de la vocal y respiración.
-- **Hilos.** Las voces activas se reparten entre hilos ayudantes; el resultado es idéntico
-  muestra a muestra con cualquier cantidad de hilos (hay un test).
+  calibrados (hombre, mujer, niño); el rostro mueve esas medidas dentro de lo que el motor
+  aguanta. La nariz abre un poco el velo. La edad acerca el cuerpo al de un niño o agrega
+  aspereza y aire. El retrato de la ventana se dibuja con los mismos valores.
+- **Qué controla Orfeón por voz**, cada 128 muestras: altura (con desafinación, deriva, ataque
+  desde abajo y expresión por nota), presión de pulmones, tensión, aire, brillo, aspereza,
+  vibrato con entrada retardada, postura de la vocal y respiración.
+- **Hilos.** Las voces activas se reparten entre hilos ayudantes, que se despiertan una vez cada
+  8 tramos. El resultado es idéntico muestra a muestra con cualquier cantidad de hilos y
+  cualquier tamaño de bloque (hay tests).
 - **Tiempo real.** Tocar notas y mover controles no reserva memoria. Cambiar cantidad de
-  cantantes, conjunto, elenco, rostro o calidad reconstruye las voces: reserva memoria y
-  corta lo que sonaba.
-
-## Compilar para Windows desde Linux
-
-Con `mingw-w64` instalado y el destino de Rust agregado
-(`rustup target add x86_64-pc-windows-gnu`):
-
-```sh
-cargo build --release --target x86_64-pc-windows-gnu -p orfeon-app -p orfeon-cli
-cargo xtask bundle orfeon-plugin --release --target x86_64-pc-windows-gnu
-```
-
-Los `.exe` y los plugins salen enlazados estáticamente: no necesitan DLL aparte. El
-`orfeon.exe` así compilado, corrido bajo Wine, rinde un WAV idéntico byte a byte al de la
-versión de Linux.
+  cantantes, conjunto, elenco, rostro común o calidad reconstruye las voces y corta lo que
+  sonaba; editar una cara reconstruye sólo a ese cantante.
 
 ## Licencia
 

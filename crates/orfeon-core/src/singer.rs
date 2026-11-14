@@ -66,7 +66,7 @@ impl VoiceType {
 }
 
 /// Rostro y cuerpo. Todo va de -1 a 1 (0 = promedio), salvo `nose` (0..1).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Face {
     /// cuello: más largo = faringe más larga, voz más oscura
     pub neck: f64,
@@ -194,6 +194,13 @@ impl Singer {
     /// El cantante `index` de un coro. `face` es el rostro común a todos y `variation` (0..1)
     /// cuánto se aparta cada uno de él. Determinista para una misma semilla.
     pub fn new(ensemble: Ensemble, index: usize, count: usize, seed: u32, face: Face, variation: f64) -> Singer {
+        Singer::with_face(ensemble, index, count, seed, face, variation, None)
+    }
+
+    /// Como `new`, pero con un rostro elegido a mano para este cantante (`custom`): reemplaza
+    /// al rostro común más su variación. El resto de sus rasgos (afinación, vibrato, lugar)
+    /// sigue saliendo de la semilla, así editar la cara no cambia a la persona.
+    pub fn with_face(ensemble: Ensemble, index: usize, count: usize, seed: u32, face: Face, variation: f64, custom: Option<Face>) -> Singer {
         let variation = if variation.is_finite() { variation.clamp(0.0, 1.0) } else { 0.0 };
         let mut rng = Rng::new((seed as u64) << 16 | (index as u64 + 1) << 4 | ensemble.index() as u64);
         let voice_type = ensemble.voice_type(index);
@@ -205,7 +212,10 @@ impl Singer {
             nose: rng.unit() * 0.5 * variation,
             age: rng.bell() * 0.6 * variation,
         };
-        let face = face.plus(own);
+        let face = match custom {
+            Some(c) => c.plus(Face::default()),
+            None => face.plus(own),
+        };
 
         // --- cuerpo ---
         let (mut mix, type_scale) = voice_type.base();

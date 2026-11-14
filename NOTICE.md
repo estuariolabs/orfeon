@@ -38,6 +38,16 @@ El plugin usa **nih-plug**, de Robbert van der Helm: <https://github.com/robbert
 (ISC). Su exportación VST3 depende de `vst3-sys` (GPL-3.0), por eso el plugin compilado se
 distribuye bajo GPL-3.0.
 
+## Interfaz, audio y MIDI
+
+- **egui** (MIT o Apache-2.0), **egui-baseview** de Billy Messenger (MIT) y **baseview**
+  (MIT o Apache-2.0): la ventana, en la app y en el plugin.
+- **cpal** (Apache-2.0), **midir** (MIT) y **rtrb** (MIT o Apache-2.0): salida de audio, entrada
+  MIDI y la cola entre hilos de la app.
+
+Los dibujos de la ventana (caras, escenario, carta de vocales, teclado) son propios, hechos con
+código.
+
 ## Lo que Orfeón no usa
 
 No contiene código, programas, nombres, textos ni gráficos de ningún producto comercial. Las

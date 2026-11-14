@@ -6,11 +6,15 @@ edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "orfeon-vivo"
+name = "orfeon-app"
 path = "src/main.rs"
 
 [dependencies]
 orfeon-core = { path = "../orfeon-core" }
+orfeon-ui = { path = "../orfeon-ui" }
+# ventana: las mismas versiones que usa el editor del plugin (nih_plug_egui)
+egui-baseview = { git = "https://github.com/BillyDM/egui-baseview.git", rev = "ec70c3fe6b2f070dcacbc22924431edbe24bd1c0" }
+baseview = { git = "https://github.com/RustAudio/baseview.git", rev = "9a0b42c09d712777b2edb4c5e0cb6baf21e988f0", features = ["opengl"] }
 # salida de audio (WASAPI / CoreAudio / ALSA) y entrada MIDI
 cpal = "0.15"
 midir = "0.10"
@@ -19,4 +23,4 @@ rtrb = "0.3"
 
 # Windows: prioridad de audio (MMCSS "Pro Audio") y reloj del sistema a 1 ms
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Media"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Media", "Win32_System_Console"] }

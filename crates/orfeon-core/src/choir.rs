@@ -109,6 +109,9 @@ pub struct ChoirParams {
     pub max_voices: usize,
     /// (estructural)
     pub quality: Quality,
+    /// rostros elegidos a mano, por cantante (None = el que le toca por elenco y variedad).
+    /// Cambiar uno reconstruye sólo ese cantante.
+    pub custom: [Option<Face>; MAX_SINGERS],
 }
 
 impl ChoirParams {
@@ -137,7 +140,21 @@ impl ChoirParams {
         gain_db: 0.0,
         max_voices: 8,
         quality: Quality::Alta,
+        custom: [None; MAX_SINGERS],
     };
+
+    /// El cantante `i` tal como lo arma el coro con estos parámetros (sin crear su voz).
+    /// Sirve para dibujarlo.
+    pub fn singer(&self, i: usize) -> Singer {
+        let n = self.singers.clamp(1, MAX_SINGERS);
+        let i = i.min(MAX_SINGERS - 1);
+        Singer::with_face(self.ensemble, i, n, self.seed, self.face, self.variation, self.custom[i])
+    }
+
+    /// ¿Mismos parámetros salvo lo que depende de la máquina (tope de voces, calidad, volumen)?
+    pub fn same_sound(&self, o: &ChoirParams) -> bool {
+        ChoirParams { max_voices: o.max_voices, quality: o.quality, gain_db: o.gain_db, ..*self } == *o
+    }
 
     fn structural(&self) -> (usize, Ensemble, u32, Face, u64, Quality) {
         (self.singers.clamp(1, MAX_SINGERS), self.ensemble, self.seed, self.face, self.variation.to_bits(), self.quality)
@@ -474,6 +491,8 @@ pub struct Choir {
     active: [usize; MAX_SINGERS],
     n_active: usize,
     thread_init: Option<fn()>,
+    /// nivel reciente de cada cantante
+    levels: [f32; MAX_SINGERS],
 }
 
 impl Choir {
@@ -514,6 +533,7 @@ impl Choir {
             active: [0; MAX_SINGERS],
             n_active: 0,
             thread_init: init,
+            levels: [0.0; MAX_SINGERS],
         };
         choir.set_threads(threads);
         choir.rebuild();
@@ -578,11 +598,14 @@ impl Choir {
     /// corta las notas).
     pub fn set_params(&mut self, p: ChoirParams) {
         let rebuild = p.structural() != self.params.structural();
+        let faces = p.custom != self.params.custom;
         let mode_changed = p.mode != self.params.mode;
         self.params = p;
         self.room.set_kind(p.room);
         if rebuild {
             self.rebuild();
+        } else if faces {
+            self.rebuild_changed();
         } else if mode_changed {
             self.all_notes_off();
         }
@@ -592,13 +615,33 @@ impl Choir {
         let p = self.params;
         let n = p.singers.clamp(1, MAX_SINGERS);
         for i in 0..MAX_SINGERS {
-            let slot = if i < n { Some(Slot::new(self.fs, Singer::new(p.ensemble, i, n, p.seed, p.face, p.variation), p.quality)) } else { None };
+            let slot = if i < n { Some(Slot::new(self.fs, p.singer(i), p.quality)) } else { None };
             *lock(&self.shared.slots[i]) = slot;
         }
         self.count = n;
         self.stack_len = 0;
         self.rr = 0;
         self.n_active = 0;
+        self.levels = [0.0; MAX_SINGERS];
+    }
+
+    /// Sólo un rostro cambió: se reconstruyen los cantantes que cambiaron; los demás siguen
+    /// cantando sin cortes.
+    fn rebuild_changed(&mut self) {
+        let p = self.params;
+        for i in 0..self.count {
+            let s = p.singer(i);
+            let mut g = lock(&self.shared.slots[i]);
+            if g.as_ref().map_or(true, |old| old.singer != s) {
+                *g = Some(Slot::new(self.fs, s, p.quality));
+                self.levels[i] = 0.0;
+            }
+        }
+    }
+
+    /// Nivel reciente de cada cantante (0..1 aprox.), para animar una interfaz.
+    pub fn levels(&self) -> &[f32; MAX_SINGERS] {
+        &self.levels
     }
 
     fn slot(&self, i: usize) -> MutexGuard<'_, Option<Slot>> {
@@ -865,6 +908,9 @@ impl Choir {
         }
 
         // ---- mezcla, tramo por tramo ----
+        for l in self.levels.iter_mut() {
+            *l *= 0.8;
+        }
         let mut off = 0;
         for c in 0..nc {
             let n = ctls[c].n;
@@ -890,12 +936,20 @@ impl Choir {
         let width = p.width.clamp(0.0, 1.0) * (1.0 - 0.45 * mic);
         for a in 0..listed {
             let idx = self.active[a];
-            let mut g = self.slot(idx);
+            let shared = self.shared.clone();
+            let mut g = lock(&shared.slots[idx]);
             let Some(s) = g.as_mut() else { continue };
             if !s.wanted[c] {
                 continue;
             }
             sounding += 1;
+            let mut lv = 0f32;
+            for x in &s.out[base..base + n] {
+                lv = lv.max(x.abs());
+            }
+            if lv > self.levels[idx] {
+                self.levels[idx] = lv;
+            }
             let dist = (0.5 * mic + 0.6 * s.singer.depth * p.depth.clamp(0.0, 1.0)).clamp(0.0, 1.1);
             let pan = (s.singer.pan * width).clamp(-1.0, 1.0);
             let ang = (pan + 1.0) * std::f64::consts::FRAC_PI_4;
