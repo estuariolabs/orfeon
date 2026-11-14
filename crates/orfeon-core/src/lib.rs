@@ -6,6 +6,7 @@
 //! comandos.
 
 pub mod choir;
+pub mod console;
 pub mod preset;
 pub mod rng;
 pub mod room;

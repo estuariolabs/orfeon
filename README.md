@@ -13,7 +13,8 @@ de Jameson Hodge (MIT), usado como dependencia sin modificar. Ver [`NOTICE.md`](
 |---|---|
 | Núcleo (`crates/orfeon-core`) | Compila. 12 tests pasan. |
 | Línea de comandos (`crates/orfeon-cli`) | Compila y rinde audio. Es la forma verificada de escucharlo. |
-| Plugin CLAP / VST3 (`crates/orfeon-plugin`) | Compila y se empaqueta (probado en Linux). **Nunca se cargó en un DAW.** |
+| App independiente (`crates/orfeon-app`) | Compila para Windows y Linux. Probada bajo Wine con una placa de sonido virtual: abre el audio, canta y responde a los comandos. **No se probó con parlantes reales ni con un teclado MIDI.** |
+| Plugin CLAP / VST3 (`crates/orfeon-plugin`) | Compila y se empaqueta para Linux y Windows. **Nunca se cargó en un DAW.** |
 | Sonido | Nadie lo escuchó todavía: estilos, programas y niveles se eligieron a mano y por medición. |
 
 ## Qué hace
@@ -68,7 +69,17 @@ cargo run --release -p orfeon-cli -- render salida.wav --score notas.txt --prese
 Opciones: `--mode coro|tutti|solo`, `--singers N`, `--style 1..8`, `--room 1..5`,
 `--vowel a|e|i|o|u`, `--voices N`, `--eco`, `--threads N`, `--tail SEG`.
 
-### 2. Cuántas voces aguanta tu máquina
+### 2. La app independiente (sin DAW)
+
+```sh
+cargo run --release -p orfeon-app
+```
+
+Abre la salida de audio por defecto y el primer teclado MIDI que encuentre. Se toca con el
+teclado MIDI o con comandos (`n 48 55 64 72`, `demo`, `p catedral`, `ayuda`). En Linux hace
+falta `libasound2-dev` y `pkg-config` para compilarla.
+
+### 3. Cuántas voces aguanta tu máquina
 
 ```sh
 cargo run --release -p orfeon-cli -- bench
@@ -78,7 +89,7 @@ cargo run --release -p orfeon-cli -- bench --eco
 Mide la carga para 1, 2, 4, 8, 16, 32 y 64 voces. Por debajo de ~70 % se puede tocar en vivo.
 Usá el resultado para fijar "Voces a la vez" en el plugin.
 
-### 3. El plugin
+### 4. El plugin
 
 ```sh
 cargo xtask bundle orfeon-plugin --release
@@ -161,6 +172,8 @@ crates/orfeon-core/     el coro (sin E/S)
   preset.rs             los 36 programas
   tests/choir.rs        tests
 crates/orfeon-cli/      rinde WAV, lista programas, mide la carga
+crates/orfeon-app/      app independiente: audio en tiempo real, MIDI y comandos
+  (los comandos se interpretan en orfeon-core/src/console.rs, con sus tests)
 crates/orfeon-plugin/   plugin CLAP/VST3 (nih-plug)
 xtask/                  empaquetador del plugin (`cargo xtask bundle`)
 ```
@@ -178,6 +191,20 @@ xtask/                  empaquetador del plugin (`cargo xtask bundle`)
 - **Tiempo real.** Tocar notas y mover controles no reserva memoria. Cambiar cantidad de
   cantantes, conjunto, elenco, rostro o calidad reconstruye las voces: reserva memoria y
   corta lo que sonaba.
+
+## Compilar para Windows desde Linux
+
+Con `mingw-w64` instalado y el destino de Rust agregado
+(`rustup target add x86_64-pc-windows-gnu`):
+
+```sh
+cargo build --release --target x86_64-pc-windows-gnu -p orfeon-app -p orfeon-cli
+cargo xtask bundle orfeon-plugin --release --target x86_64-pc-windows-gnu
+```
+
+Los `.exe` y los plugins salen enlazados estáticamente: no necesitan DLL aparte. El
+`orfeon.exe` así compilado, corrido bajo Wine, rinde un WAV idéntico byte a byte al de la
+versión de Linux.
 
 ## Licencia
 
