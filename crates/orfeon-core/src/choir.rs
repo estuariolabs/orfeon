@@ -742,6 +742,7 @@ impl Choir {
         let n = self.count;
         let limit = self.voices_limit();
         let mut held = 0;
+        let mut repeated = None;
         let mut oldest: Option<(usize, u64)> = None;
         let mut best: Option<(usize, f64)> = None;
         for j in 0..n {
@@ -749,6 +750,10 @@ impl Choir {
             let g = self.slot(i);
             let Some(s) = g.as_ref() else { continue };
             if s.held {
+                if s.note_id == id {
+                    repeated = Some(i);
+                    break;
+                }
                 held += 1;
                 if oldest.map_or(true, |(_, b)| s.born < b) {
                     oldest = Some((i, s.born));
@@ -763,7 +768,9 @@ impl Choir {
                 best = Some((i, score));
             }
         }
-        let pick = if held >= limit { oldest.map(|o| o.0) } else { best.map(|b| b.0).or(oldest.map(|o| o.0)) };
+        let pick = repeated.or_else(|| {
+            if held >= limit { oldest.map(|o| o.0) } else { best.map(|b| b.0).or(oldest.map(|o| o.0)) }
+        });
         let Some(i) = pick else { return };
         self.order += 1;
         let order = self.order;
@@ -772,12 +779,14 @@ impl Choir {
             let delay = (s.singer.lateness * self.params.humanize * 0.035 * self.fs) as i64;
             let k = s.singer.fold(key as f64);
             if s.held {
-                s.release(); // robada: ataca de nuevo, no liga
+                s.release(); // repetida o robada: ataca de nuevo
             }
             s.start(id, k, vel, delay, order);
         }
         drop(g);
-        self.rr = (i + 1) % n;
+        if repeated.is_none() {
+            self.rr = (i + 1) % n;
+        }
     }
 
     // ---------------------------------------------------------------- expresión
