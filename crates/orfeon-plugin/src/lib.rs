@@ -386,19 +386,21 @@ enum LyricsUpdate {
 }
 
 struct Shared {
+    panic: AtomicBool,
     lyrics: Mutex<Option<LyricsUpdate>>,
     /// carga del cálculo en milésimas, voces sonando, nivel por cantante (bits de f32), notas
     load: AtomicU32,
     voices: AtomicUsize,
     levels: [AtomicU32; MAX_SINGERS],
     held: [AtomicBool; 128],
-    /// notas del teclado de pantalla: (apretada, nota, velocidad). 255 = apagar todo.
+    /// Notas del teclado de pantalla. El pánico usa una señal aparte.
     screen: Mutex<Option<rtrb::Producer<(bool, u8, f32, usize)>>>,
 }
 
 impl Default for Shared {
     fn default() -> Self {
         Shared {
+            panic: AtomicBool::new(false),
             lyrics: Mutex::new(None),
             load: AtomicU32::new(0),
             voices: AtomicUsize::new(0),
@@ -507,7 +509,10 @@ impl Plugin for Orfeon {
                     let msg = match ev {
                         orfeon_ui::Event::NoteOn(k, v, part) => Some((true, k, v, part)),
                         orfeon_ui::Event::NoteOff(k, part) => Some((false, k, 0.0, part)),
-                        orfeon_ui::Event::AllOff => Some((false, 255, 0.0, 0)),
+                        orfeon_ui::Event::AllOff => {
+                            st.shared.panic.store(true, Ordering::Release);
+                            None
+                        }
                         orfeon_ui::Event::Threads(n) => {
                             setter.begin_set_parameter(&st.params.threads);
                             setter.set_parameter(&st.params.threads, n as i32);
@@ -579,21 +584,24 @@ impl Plugin for Orfeon {
 
         let t0 = Instant::now();
         // ---- teclado de pantalla ----
+        let panic = self.shared.panic.swap(false, Ordering::AcqRel);
         if let Some(rx) = self.screen.as_mut() {
             while let Ok((on, key, vel, part)) = rx.pop() {
                 let id = SCREEN_ID + (part as i32) * 128 + key as i32;
-                if key == 255 {
-                    choir.all_notes_off();
-                    for h in self.shared.held.iter() {
-                        h.store(false, Ordering::Relaxed);
-                    }
-                } else if on {
+                if panic { continue; }
+                if on {
                     choir.note_on(id, key, vel as f64);
                     self.shared.held[key as usize & 127].store(true, Ordering::Relaxed);
                 } else {
                     choir.note_off(id);
                     self.shared.held[key as usize & 127].store(false, Ordering::Relaxed);
                 }
+            }
+        }
+        if panic {
+            choir.all_notes_off();
+            for held in &self.shared.held {
+                held.store(false, Ordering::Relaxed);
             }
         }
         // ---- controles ----

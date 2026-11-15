@@ -268,6 +268,51 @@ fn midi_ports() -> Vec<String> {
     }
 }
 
+fn decode_midi(msg: &[u8]) -> Option<Msg> {
+    if msg.len() < 3 {
+        return None;
+    }
+    let (status, ch) = (msg[0] & 0xF0, (msg[0] & 0x0F) as i32);
+    let d1 = msg[1] & 0x7F;
+    let d2 = msg[2] & 0x7F;
+    let id = ch * 128 + d1 as i32;
+    match status {
+        0x90 if d2 > 0 => Some(Msg::On(id, d1, d2 as f64 / 127.0)),
+        0x80 | 0x90 => Some(Msg::Off(id)),
+        // rueda de afinación: 14 bits, ±2 semitonos
+        0xE0 => Some(Msg::Bend((((d2 as i32) << 7 | d1 as i32) - 8192) as f64 / 8192.0 * 2.0)),
+        // CC 120 / 123: todo fuera
+        0xB0 if d1 == 120 || d1 == 123 => Some(Msg::AllOff),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod midi_tests {
+    use super::*;
+
+    #[test]
+    fn cc123_recupera_un_note_off_perdido() {
+        let mut choir = Choir::new(48_000.0, 1);
+        let mut left = [0.; 512];
+        let mut right = [0.; 512];
+        // El emisor quitó 60 y sumó 62 en un diff que no llegó.
+        for bytes in [[0x90,60,100], [0x90,64,100], [0x80,62,0], [0x80,64,0]] {
+            match decode_midi(&bytes).unwrap() {
+                Msg::On(id, key, velocity) => choir.note_on(id, key, velocity),
+                Msg::Off(id) => choir.note_off(id),
+                _ => unreachable!(),
+            }
+        }
+        for _ in 0..120 { choir.render(&mut left, &mut right); }
+        assert_eq!(choir.sounding(), 1);
+        assert!(matches!(decode_midi(&[0xb0,123,0]), Some(Msg::AllOff)));
+        choir.all_notes_off();
+        for _ in 0..120 { choir.render(&mut left, &mut right); }
+        assert_eq!(choir.sounding(), 0);
+    }
+}
+
 /// Se conecta a la entrada `index` (desde 0). La conexión vive mientras se guarde el valor.
 fn midi_connect(index: usize, tx: Sender<Msg>, producer: std::thread::Thread) -> Result<(midir::MidiInputConnection<()>, String), String> {
     let mut input = midir::MidiInput::new("Orfeon").map_err(|e| e.to_string())?;
@@ -320,22 +365,7 @@ fn midi_connect(index: usize, tx: Sender<Msg>, producer: std::thread::Thread) ->
                         lost_records += 1;
                     }
                 }
-                if msg.len() < 3 {
-                    return;
-                }
-                let (status, ch) = (msg[0] & 0xF0, (msg[0] & 0x0F) as i32);
-                let d1 = msg[1] & 0x7F;
-                let d2 = msg[2] & 0x7F;
-                let id = ch * 128 + d1 as i32;
-                let m = match status {
-                    0x90 if d2 > 0 => Some(Msg::On(id, d1, d2 as f64 / 127.0)),
-                    0x80 | 0x90 => Some(Msg::Off(id)),
-                    // rueda de afinación: 14 bits, ±2 semitonos
-                    0xE0 => Some(Msg::Bend((((d2 as i32) << 7 | d1 as i32) - 8192) as f64 / 8192.0 * 2.0)),
-                    // CC 120 / 123: todo fuera
-                    0xB0 if d1 == 120 || d1 == 123 => Some(Msg::AllOff),
-                    _ => None,
-                };
+                let m = decode_midi(msg);
                 if let Some(m) = m {
                     let _ = tx.send(m);
                     producer.unpark();
