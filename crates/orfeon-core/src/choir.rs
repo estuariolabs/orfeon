@@ -10,7 +10,7 @@
 use crate::lyrics::{self, Lyrics, SungSyllable};
 use crate::rng::Rng;
 use crate::room::{Room, RoomKind};
-use crate::singer::{Ensemble, Face, Singer};
+use crate::singer::{Ensemble, Face, Singer, VoiceType};
 use crate::style::{Style, StyleDef};
 use crate::vowel::VowelSpace;
 use crate::MAX_SINGERS;
@@ -114,6 +114,10 @@ pub struct ChoirParams {
     pub voice_leading: bool,
     /// Separación de ataque de grave a agudo, en milisegundos (0..40).
     pub stagger_ms: f64,
+    /// Asignación conjunta del acorde en un coro mixto de cuatro voces.
+    pub satb: bool,
+    /// Ancho total del escalonado SATB, en milisegundos (0..120).
+    pub phrase_ms: f64,
     /// multiplicador del vibrato del estilo (0..2)
     pub vibrato: f64,
     /// aire agregado a la voz (-0.5..0.5)
@@ -158,6 +162,8 @@ impl ChoirParams {
         humanize: 0.6,
         voice_leading: false,
         stagger_ms: 0.0,
+        satb: false,
+        phrase_ms: 0.0,
         vibrato: 1.0,
         breath: 0.0,
         brightness: 0.0,
@@ -525,6 +531,23 @@ fn worker(shared: Arc<Shared>, init: Option<fn()>) {
 
 // ------------------------------------------------------------------ coro
 
+#[derive(Clone, Copy)]
+pub enum NoteChange {
+    On(i32, u8, f64),
+    Off(i32),
+}
+
+impl NoteChange {
+    fn id(self) -> i32 {
+        match self {
+            Self::On(id, ..) | Self::Off(id) => id.max(0),
+        }
+    }
+}
+
+// El conjunto Mixto construye las voces en orden S, B, A, T.
+const SATB_ORDER: [usize; 4] = [1, 3, 2, 0];
+
 pub struct Choir {
     fs: f64,
     params: ChoirParams,
@@ -549,6 +572,9 @@ pub struct Choir {
     thread_init: Option<fn()>,
     /// nivel reciente de cada cantante
     levels: [f32; MAX_SINGERS],
+    changes: [NoteChange; 8],
+    change_count: usize,
+    releases: [usize; 4],
 }
 
 impl Choir {
@@ -594,6 +620,9 @@ impl Choir {
             n_active: 0,
             thread_init: init,
             levels: [0.0; MAX_SINGERS],
+            changes: [NoteChange::Off(0); 8],
+            change_count: 0,
+            releases: [0; 4],
         };
         choir.set_threads(threads);
         choir.rebuild();
@@ -657,11 +686,21 @@ impl Choir {
     /// Aplica parámetros. Si cambió algo estructural reconstruye las voces (reserva memoria y
     /// corta las notas).
     pub fn set_params(&mut self, p: ChoirParams) {
+        self.flush_notes();
         let rebuild = p.structural() != self.params.structural();
         let faces = p.custom != self.params.custom;
         let mode_changed = p.mode != self.params.mode;
         let previous_parts = self.params.parts;
+        let was_satb = self.batches_satb();
         self.params = p;
+        if was_satb && (!self.batches_satb() || rebuild || faces) {
+            for i in 0..4 {
+                if self.releases[i] > 0 {
+                    self.slot(i).as_mut().unwrap().release();
+                }
+            }
+            self.releases.fill(0);
+        }
         self.room.set_kind(p.room);
         if rebuild {
             self.rebuild();
@@ -765,6 +804,8 @@ impl Choir {
     }
 
     pub fn all_notes_off(&mut self) {
+        self.change_count = 0;
+        self.releases.fill(0);
         self.stack_len = 0;
         self.part_len.fill(0);
         for i in 0..self.count {
@@ -932,6 +973,167 @@ impl Choir {
         }
     }
 
+    pub fn batches_satb(&self) -> bool {
+        self.params.satb && self.params.voice_leading && self.params.mode == Mode::Coro
+            && self.params.ensemble == Ensemble::Mixto && self.count == 4
+            && self.voices_limit() == 4
+    }
+
+    fn apply_note(&mut self, change: NoteChange) {
+        match change {
+            NoteChange::On(id, key, vel) => self.note_on(id, key, vel),
+            NoteChange::Off(id) => self.note_off(id),
+        }
+    }
+
+    /// Agrupa eventos de un mismo instante musical. El llamador delimita el grupo.
+    pub fn queue_note(&mut self, change: NoteChange) {
+        if !self.batches_satb() {
+            self.apply_note(change);
+            return;
+        }
+        if self.change_count == self.changes.len() {
+            self.flush_notes();
+        }
+        self.changes[self.change_count] = change;
+        self.change_count += 1;
+    }
+
+    pub fn flush_notes(&mut self) {
+        let count = std::mem::take(&mut self.change_count);
+        if count == 0 { return; }
+        let changes = self.changes;
+        let changes = &changes[..count];
+        if !self.assign_satb(changes) {
+            // Los reataques, robos y secuencias ambiguas mantienen el orden MIDI.
+            for i in 0..4 {
+                if self.releases[i] > 0 {
+                    self.slot(i).as_mut().unwrap().release();
+                }
+            }
+            self.releases.fill(0);
+            for &change in changes {
+                self.apply_note(change);
+            }
+        }
+    }
+
+    fn phrase_delay(&self, rank: usize) -> usize {
+        let ms = self.params.phrase_ms;
+        let ms = if ms.is_finite() { ms.clamp(0.0, 120.0) } else { 0.0 };
+        (self.fs * ms * rank as f64 / 3000.0).round() as usize
+    }
+
+    fn assign_satb(&mut self, changes: &[NoteChange]) -> bool {
+        if changes.iter().enumerate().any(|(i, c)| changes[..i].iter().any(|p| p.id() == c.id())) {
+            return false;
+        }
+        let mut notes = [(0, 0, 0.0); 4];
+        let mut n = 0;
+        for &change in changes {
+            if let NoteChange::On(id, key, vel) = change {
+                if n == notes.len() { return false; }
+                notes[n] = (id.max(0), key, vel);
+                n += 1;
+            }
+        }
+        notes[..n].sort_unstable_by_key(|&(id, key, _)| (key, id));
+        let slots: [(Singer, f64, bool, i32, bool); 4] = std::array::from_fn(|rank| {
+            let guard = self.slot(SATB_ORDER[rank]);
+            let slot = guard.as_ref().unwrap();
+            (slot.singer, slot.key, slot.born != 0, slot.note_id, slot.held)
+        });
+        if slots.map(|slot| slot.0.voice_type) != [VoiceType::Bajo, VoiceType::Tenor,
+            VoiceType::Contralto, VoiceType::Soprano] {
+            return false;
+        }
+        let mut pinned = [None; 4];
+        let mut ending = [false; 4];
+        let mut available = 0_u8;
+        for (rank, &i) in SATB_ORDER.iter().enumerate() {
+            let (_, key, _, id, held) = slots[rank];
+            if held && notes[..n].iter().any(|note| note.0 == id) {
+                return false;
+            }
+            ending[rank] = held && changes.iter().any(|c| matches!(c, NoteChange::Off(off) if (*off).max(0) == id));
+            if held && !ending[rank] && self.releases[i] == 0 {
+                pinned[rank] = Some(key);
+            } else {
+                available |= 1 << rank;
+            }
+        }
+        if n > available.count_ones() as usize { return false; }
+
+        let mut costs = [[(0.0, 0.0); 4]; 4];
+        for (j, &(_, key, _)) in notes[..n].iter().enumerate() {
+            for (rank, &(singer, previous, sung, ..)) in slots.iter().enumerate() {
+                let (lo, hi) = singer.voice_type.range();
+                let outside = lo.saturating_sub(key) + key.saturating_sub(hi);
+                let target = singer.fold(f64::from(key));
+                let anchor = if sung { previous } else { (f64::from(lo) + f64::from(hi)) * 0.5 };
+                costs[j][rank] = (target, 10.0 * f64::from(outside) + 0.3 * (target - anchor).abs());
+            }
+        }
+        let mut best = (usize::MAX, f64::INFINITY);
+        let mut assignment = [0; 4];
+        // Cada dígito en base cuatro elige un cantante para una nota. Hasta 24 asignaciones válidas.
+        for code in 0..(1 << (2 * n)) {
+            let mut free = available;
+            let mut pitches = pinned;
+            let mut ranks = [0; 4];
+            let mut cost = 0.0;
+            for j in 0..n {
+                let rank = (code >> (2 * j)) & 3;
+                if free & (1 << rank) == 0 { break; }
+                free &= !(1 << rank);
+                ranks[j] = rank;
+                let (target, weight) = costs[j][rank];
+                pitches[rank] = Some(target);
+                cost += weight;
+            }
+            if (available ^ free).count_ones() as usize != n { continue; }
+            let mut crossings = 0;
+            for (rank, low) in pitches.iter().enumerate() {
+                for high in &pitches[rank + 1..] {
+                    if matches!((low, high), (Some(a), Some(b)) if a > b) { crossings += 1; }
+                }
+            }
+            let score = (crossings, cost);
+            if score < best {
+                best = score;
+                assignment = ranks;
+            }
+        }
+
+        let mut replaced = [false; 4];
+        for (j, &(id, _, velocity)) in notes[..n].iter().enumerate() {
+            let rank = assignment[j];
+            let i = SATB_ORDER[rank];
+            replaced[rank] = true;
+            self.releases[i] = 0;
+            self.order += 1;
+            let human = slots[rank].0.lateness * self.params.humanize * 0.035 * self.fs;
+            let delay = self.phrase_delay(rank) as i64 + human as i64;
+            let mut guard = self.slot(i);
+            let slot = guard.as_mut().unwrap();
+            slot.start(id, costs[j][rank].0, velocity, delay, self.order);
+        }
+        for (rank, &i) in SATB_ORDER.iter().enumerate() {
+            if ending[rank] && !replaced[rank] && self.releases[i] == 0 {
+                let delay = self.phrase_delay(3 - rank);
+                let mut guard = self.slot(i);
+                let slot = guard.as_mut().unwrap();
+                if delay == 0 || slot.wait >= 0 {
+                    slot.release();
+                } else {
+                    drop(guard);
+                    self.releases[i] = delay;
+                }
+            }
+        }
+        true
+    }
+
     /// Coro: la nota va al cantante siguiente que esté libre, prefiriendo a quien le quede en
     /// registro. Si no hay libres (o se llegó al tope), toma el lugar de la nota más vieja.
     fn note_on_choir(&mut self, id: i32, key: u8, vel: f64) {
@@ -1042,9 +1244,22 @@ impl Choir {
         let total = left.len().min(right.len());
         let mut pos = 0;
         while pos < total {
-            let n = (total - pos).min(BLOCK);
+            let mut n = (total - pos).min(BLOCK);
+            for remaining in self.releases {
+                if remaining > 0 {
+                    n = n.min(remaining);
+                }
+            }
             self.render_block(&mut left[pos..pos + n], &mut right[pos..pos + n]);
             pos += n;
+            for i in 0..4 {
+                if self.releases[i] > 0 {
+                    self.releases[i] -= n;
+                    if self.releases[i] == 0 {
+                        self.slot(i).as_mut().unwrap().release();
+                    }
+                }
+            }
         }
     }
 
@@ -1280,5 +1495,95 @@ mod phrasing_tests {
         assert_eq!(state(&choir, 0), soprano);
         choir.all_notes_off();
         assert!((0..4).all(|i| state(&choir, i).0 == -1));
+    }
+}
+
+#[cfg(test)]
+mod satb_tests {
+    use super::*;
+
+    fn choir(phrase_ms: f64) -> Choir {
+        let mut choir = Choir::new(48_000.0, 1);
+        choir.set_params(ChoirParams {
+            mode: Mode::Coro, ensemble: Ensemble::Mixto, singers: 4, max_voices: 4,
+            voice_leading: true, satb: true, phrase_ms, humanize: 0.0,
+            ..ChoirParams::DEFAULT
+        });
+        choir
+    }
+
+    fn chord(choir: &mut Choir, previous: &[u8], next: &[u8]) {
+        for &key in previous.iter().filter(|key| !next.contains(key)) {
+            choir.queue_note(NoteChange::Off(i32::from(key)));
+        }
+        for &key in next.iter().rev().filter(|key| !previous.contains(key)) {
+            choir.queue_note(NoteChange::On(i32::from(key), key, 0.7));
+        }
+        choir.flush_notes();
+    }
+
+    #[test]
+    fn cadencia_conserva_orden_tonos_comunes_y_legato() {
+        let mut choir = choir(0.0);
+        let mut previous = Vec::new();
+        for next in [
+            [48, 55, 64, 72], [45, 57, 64, 72], [41, 57, 65, 72],
+            [43, 55, 62, 71], [48, 55, 64, 72],
+        ] {
+            let born = SATB_ORDER.map(|i| choir.slot(i).as_ref().unwrap().born);
+            chord(&mut choir, &previous, &next);
+            for (rank, i) in SATB_ORDER.into_iter().enumerate() {
+                let slot = choir.slot(i);
+                let slot = slot.as_ref().unwrap();
+                assert_eq!(slot.key, f64::from(next[rank]));
+                assert!(slot.held);
+                if !previous.is_empty() {
+                    assert_eq!(slot.wait, -1, "el cambio debe seguir ligado");
+                    assert_eq!(slot.born == born[rank], previous.contains(&next[rank]));
+                }
+            }
+            choir.render(&mut [0.0; 480], &mut [0.0; 480]);
+            previous = next.to_vec();
+        }
+    }
+
+    #[test]
+    fn escalonado_60_ms_medido_en_medidores_y_salida_inversa() {
+        let mut choir = choir(60.0);
+        chord(&mut choir, &[], &[48, 55, 64, 72]);
+        let mut entrances = [None; 4];
+        for ms in 0..75 {
+            choir.render(&mut [0.0; 48], &mut [0.0; 48]);
+            for (rank, i) in SATB_ORDER.into_iter().enumerate() {
+                if choir.levels()[i] > 0.0 {
+                    entrances[rank].get_or_insert(ms);
+                }
+            }
+        }
+        for (rank, entrance) in entrances.into_iter().enumerate() {
+            let ms = entrance.unwrap();
+            assert!((rank * 20..=rank * 20 + 4).contains(&ms), "entrada {rank}: {ms}");
+        }
+
+        chord(&mut choir, &[48, 55, 64, 72], &[]);
+        for step in 0..4 {
+            let held = SATB_ORDER.map(|i| choir.slot(i).as_ref().unwrap().held);
+            assert_eq!(held, std::array::from_fn(|i| i < 3 - step));
+            choir.render(&mut [0.0; 960], &mut [0.0; 960]);
+        }
+    }
+
+    #[test]
+    fn panico_cancela_notas_pendientes_y_salidas() {
+        let mut choir = choir(60.0);
+        chord(&mut choir, &[], &[48, 55, 64, 72]);
+        choir.render(&mut [0.0; 3000], &mut [0.0; 3000]);
+        chord(&mut choir, &[48, 55, 64, 72], &[]);
+        assert!(choir.releases.iter().any(|&n| n > 0));
+        choir.queue_note(NoteChange::On(50, 50, 0.7));
+        choir.all_notes_off();
+        choir.flush_notes();
+        assert_eq!(choir.releases, [0; 4]);
+        assert!(SATB_ORDER.into_iter().all(|i| !choir.slot(i).as_ref().unwrap().held));
     }
 }

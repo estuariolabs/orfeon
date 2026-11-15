@@ -16,6 +16,7 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use orfeon_core::console::{self, Command, DEMO, HELP};
 use orfeon_core::preset::PRESETS;
+use orfeon_core::choir::NoteChange;
 use orfeon_core::{Choir, ChoirParams, Mode, Quality};
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -128,21 +129,32 @@ fn producer(mut choir: Choir, rx: Receiver<Msg>, mut out: rtrb::Producer<f32>, s
     let mut r = vec![0f32; PRODUCE];
     let mut avg = 0.0f64;
     let cap = out.buffer().capacity();
+    let mut deadline = None;
     while !meters.quit.load(Ordering::Relaxed) {
         while let Ok(m) = rx.try_recv() {
+            let now = Instant::now();
+            if deadline.is_some_and(|until| now >= until)
+                || !matches!(m, Msg::On(..) | Msg::Off(..) | Msg::AllOff) {
+                choir.flush_notes();
+                deadline = None;
+            }
+            if choir.batches_satb() && matches!(m, Msg::On(..) | Msg::Off(..)) {
+                deadline.get_or_insert(now + Duration::from_millis(3));
+            }
             match m {
                 Msg::On(id, key, vel) => {
-                    choir.note_on(id, key, vel);
+                    choir.queue_note(NoteChange::On(id, key, vel));
                     meters.held[(key & 127) as usize].store(true, Ordering::Relaxed);
                 }
                 Msg::Off(id) => {
-                    choir.note_off(id);
+                    choir.queue_note(NoteChange::Off(id));
                     // los id de MIDI y de la pantalla son canal*128 + nota
                     meters.held[id.rem_euclid(128) as usize].store(false, Ordering::Relaxed);
                 }
                 Msg::Bend(s) => choir.set_pitch_bend(s),
                 Msg::AllOff => {
                     choir.all_notes_off();
+                    deadline = None;
                     for h in meters.held.iter() {
                         h.store(false, Ordering::Relaxed);
                     }
@@ -152,6 +164,10 @@ fn producer(mut choir: Choir, rx: Receiver<Msg>, mut out: rtrb::Producer<f32>, s
                 Msg::Lyrics(bank) => { choir.replace_lyrics(bank); }
                 Msg::ResetLyrics => choir.reset_lyrics(),
             }
+        }
+        if deadline.is_some_and(|until| Instant::now() >= until) {
+            choir.flush_notes();
+            deadline = None;
         }
         let queued = (cap - out.slots()) / 2;
         let target = meters.latency.load(Ordering::Relaxed);

@@ -481,7 +481,17 @@ fn tab_voice(ui: &mut Ui, m: &mut Model) {
     if m.params.mode == Mode::Coro {
         ui.checkbox(&mut m.params.voice_leading, "Conducción vocal")
             .on_hover_text("Favorece movimientos cortos de cada cantante al llegar notas nuevas");
-        slider_f(ui, &mut m.params.stagger_ms, 0.0, 40.0, "separación de entradas (ms)");
+        let can_group = m.params.voice_leading && m.params.ensemble == orfeon_core::Ensemble::Mixto
+            && m.params.singers == 4 && m.params.max_voices >= 4;
+        if can_group {
+            ui.checkbox(&mut m.params.satb, "Asignar acordes en conjunto (SATB)")
+                .on_hover_text("Busca un reparto para todo el acorde y conserva las notas sostenidas");
+        }
+        if can_group && m.params.satb {
+            slider_f(ui, &mut m.params.phrase_ms, 0.0, 120.0, "Escalonado total de entradas y salidas (ms)");
+        } else {
+            slider_f(ui, &mut m.params.stagger_ms, 0.0, 40.0, "separación de entradas (ms)");
+        }
     }
     ui.label(RichText::new("Cada cantante deriva, respira y entra un poco a su manera; humanizar en 0 los alinea a todos.").color(DIM).small());
 }

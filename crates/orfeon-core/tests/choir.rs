@@ -269,6 +269,8 @@ fn todos_los_programas_suenan() {
     names.sort();
     names.dedup();
     assert_eq!(names.len(), PRESETS.len(), "hay programas con el mismo nombre o sin nombre");
+    assert_eq!(PRESETS[36].name, "Cuarteto coral");
+    assert_eq!(PRESETS[37].name, "Coro SATB");
     assert!(PRESETS.iter().all(|p| !p.name.is_empty()));
 }
 
