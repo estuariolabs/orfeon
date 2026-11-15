@@ -1,4 +1,4 @@
-//! Programas de fábrica: 37 puntos de partida. Son combinaciones elegidas a mano de los
+//! Programas de fábrica: 38 puntos de partida. Son combinaciones elegidas a mano de los
 //! mismos parámetros que se pueden mover; ninguno fue ajustado contra grabaciones.
 
 use crate::choir::{ChoirParams, Mode, Quality};
@@ -25,7 +25,7 @@ const fn p(name: &'static str, mode: Mode, ensemble: Ensemble, singers: usize, s
     Preset { name, params: ChoirParams { mode, ensemble, singers, style, vowel_x: vowel.0, vowel_y: vowel.1, room, mic, max_voices: if singers < 8 { singers } else { 8 }, ..D } }
 }
 
-pub const PRESETS: [Preset; 37] = [
+pub const PRESETS: [Preset; 38] = [
     // --- coros mixtos ---
     p("Coro de cámara", Mode::Coro, Ensemble::Mixto, 8, Style::Clasico, A, RoomKind::Sala, 0.35),
     p("Coro sinfónico", Mode::Coro, Ensemble::Mixto, 32, Style::Clasico, A, RoomKind::Sala, 0.55),
@@ -72,6 +72,10 @@ pub const PRESETS: [Preset; 37] = [
     Preset { name: "Cuarteto coral", params: ChoirParams {
         voice_leading: true, stagger_ms: 24.0, humanize: 0.35, vowel_spread: 0.2,
         room_mix: 0.18, ..p("", Mode::Coro, Ensemble::Mixto, 4, Style::Clasico, A, RoomKind::Estudio, 0.25).params
+    } },
+    Preset { name: "Coro SATB", params: ChoirParams {
+        voice_leading: true, satb: true, phrase_ms: 60.0, humanize: 0.35,
+        ..p("", Mode::Coro, Ensemble::Mixto, 4, Style::Clasico, A, RoomKind::Estudio, 0.25).params
     } },
 ];
 

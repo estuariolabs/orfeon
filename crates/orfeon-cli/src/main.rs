@@ -2,6 +2,7 @@
 //! voces aguanta una máquina.
 
 use orfeon_core::preset::{find, PRESETS};
+use orfeon_core::choir::NoteChange;
 use orfeon_core::{Choir, ChoirParams, Mode, Quality, RoomKind, Style};
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -33,6 +34,7 @@ fn usage() -> ! {
          --score ARCHIVO      partitura de texto: una nota por línea, \"inicio duración nota [velocidad]\"\n  \
          --mode coro|tutti|solo   --singers N   --style 1..8   --room 1..5\n  \
          --vowel a|e|i|o|u    --voices N (tope simultáneo)   --eco (calidad económica)\n  \
+         --fraseo-ms MS       ancho del escalonado SATB entre 0 y 120 ms\n  \
          --sin-fraseo         desactiva conducción y escalonado para comparar\n  \
          --threads N          hilos de cálculo (por defecto: los de la máquina)\n  \
          --tail SEG           segundos de cola al final (por defecto 3)"
@@ -132,8 +134,14 @@ fn parse(args: &[String]) -> Opts {
                 i += 1;
             }
             "--sin-fraseo" => {
+                o.params.satb = false;
+                o.params.phrase_ms = 0.0;
                 o.params.voice_leading = false;
                 o.params.stagger_ms = 0.0;
+            }
+            "--fraseo-ms" => {
+                o.params.phrase_ms = num(val(i)).clamp(0.0, 120.0);
+                i += 1;
             }
             "--eco" => o.params.quality = Quality::Eco,
             "--threads" => {
@@ -248,19 +256,22 @@ fn render(o: &Opts, notes: &[Note]) -> (Vec<f32>, Vec<f32>, f64, usize) {
     let end = ev.last().map_or(0, |e| e.0) + (o.tail * FS) as usize;
     let mut l = vec![0f32; end];
     let mut r = vec![0f32; end];
+    let batches_satb = choir.batches_satb();
     let moving = o.demo == "vocales" && o.score.is_none();
     let t0 = Instant::now();
     let (mut pos, mut k, mut peak) = (0usize, 0usize, 0usize);
     while pos < end {
         while k < ev.len() && ev[k].0 <= pos {
-            let (_, on, id, key, vel) = ev[k];
+            let (time, on, id, key, vel) = ev[k];
+            if k > 0 && ev[k - 1].0 != time { choir.flush_notes(); }
             if on {
-                choir.note_on(id, key, vel);
+                choir.queue_note(NoteChange::On(id, key, vel));
             } else {
-                choir.note_off(id);
+                choir.queue_note(NoteChange::Off(id));
             }
             k += 1;
         }
+        choir.flush_notes();
         if moving {
             // demo de vocales: a - e - i - o - u, dos segundos cada una
             let v = ['a', 'e', 'i', 'o', 'u'][((pos as f64 / FS / 2.0) as usize).min(4)];
@@ -270,7 +281,12 @@ fn render(o: &Opts, notes: &[Note]) -> (Vec<f32>, Vec<f32>, f64, usize) {
             p.vowel_y = y;
             choir.set_params(p);
         }
-        let n = 128.min(end - pos);
+        let mut n = 128.min(end - pos);
+        if batches_satb {
+            if let Some(event) = ev.get(k) {
+                n = n.min(event.0 - pos);
+            }
+        }
         choir.render(&mut l[pos..pos + n], &mut r[pos..pos + n]);
         peak = peak.max(choir.sounding());
         pos += n;

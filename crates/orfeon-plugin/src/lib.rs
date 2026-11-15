@@ -8,6 +8,7 @@
 use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, EguiState};
 use orfeon_core::singer::Face;
+use orfeon_core::choir::NoteChange;
 use orfeon_core::{Choir, ChoirParams, MAX_SINGERS};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -170,6 +171,10 @@ struct OrfeonParams {
     part3_high: IntParam,
     #[id = "part3_style"]
     part3_style: EnumParam<StyleP>,
+    #[id = "satb"]
+    satb: BoolParam,
+    #[id = "satbspan"]
+    phrase_ms: FloatParam,
 }
 
 fn unit(name: &str, default: f32) -> FloatParam {
@@ -219,6 +224,8 @@ impl Default for OrfeonParams {
             max_voices: IntParam::new("Voces a la vez (tope)", d.max_voices as i32, IntRange::Linear { min: 1, max: 64 }),
             quality: EnumParam::new("Calidad", QualityP::Alta),
             voice_leading: BoolParam::new("Conducción vocal", d.voice_leading),
+            satb: BoolParam::new("Agrupar acordes SATB", d.satb),
+            phrase_ms: FloatParam::new("Escalonado SATB", d.phrase_ms as f32, FloatRange::Linear { min: 0.0, max: 120.0 }).with_unit(" ms"),
             stagger_ms: FloatParam::new("Entradas de grave a agudo", d.stagger_ms as f32, FloatRange::Linear { min: 0.0, max: 40.0 }).with_unit(" ms"),
             part0_low: IntParam::new("Parte 1: Grave", d.parts[0].low as i32, IntRange::Linear { min: 0, max: 127 }),
             part0_high: IntParam::new("Parte 1: Aguda", d.parts[0].high as i32, IntRange::Linear { min: 0, max: 127 }),
@@ -256,6 +263,8 @@ impl OrfeonParams {
                 humanize: self.humanize.value() as f64,
                 voice_leading: self.voice_leading.value(),
                 stagger_ms: self.stagger_ms.value() as f64,
+                satb: self.satb.value(),
+                phrase_ms: self.phrase_ms.value() as f64,
                 vibrato: self.vibrato.value() as f64,
                 breath: self.breath.value() as f64,
                 brightness: self.brightness.value() as f64,
@@ -339,6 +348,12 @@ impl OrfeonParams {
             setter.end_set_parameter(&self.voice_leading);
         }
         f(setter, &self.stagger_ms, old.stagger_ms, new.stagger_ms);
+        if old.satb != new.satb {
+            setter.begin_set_parameter(&self.satb);
+            setter.set_parameter(&self.satb, new.satb);
+            setter.end_set_parameter(&self.satb);
+        }
+        f(setter, &self.phrase_ms, old.phrase_ms, new.phrase_ms);
         i(setter, &self.part0_low, old.parts[0].low as i32, new.parts[0].low as i32);
         i(setter, &self.part0_high, old.parts[0].high as i32, new.parts[0].high as i32);
         e(setter, &self.part0_style, old.parts[0].style.index(), new.parts[0].style.index());
@@ -590,10 +605,10 @@ impl Plugin for Orfeon {
                 let id = SCREEN_ID + (part as i32) * 128 + key as i32;
                 if panic { continue; }
                 if on {
-                    choir.note_on(id, key, vel as f64);
+                    choir.queue_note(NoteChange::On(id, key, vel as f64));
                     self.shared.held[key as usize & 127].store(true, Ordering::Relaxed);
                 } else {
-                    choir.note_off(id);
+                    choir.queue_note(NoteChange::Off(id));
                     self.shared.held[key as usize & 127].store(false, Ordering::Relaxed);
                 }
             }
@@ -604,6 +619,7 @@ impl Plugin for Orfeon {
                 held.store(false, Ordering::Relaxed);
             }
         }
+        choir.flush_notes();
         // ---- controles ----
         let want = self.params.choir(&self.applied);
         if want != self.applied {
@@ -642,16 +658,16 @@ impl Plugin for Orfeon {
                     Some(ev) if (ev.timing() as usize) <= pos => {
                         match ev {
                             NoteEvent::NoteOn { channel, note, velocity, .. } => {
-                                choir.note_on(note_id(channel, note), note, velocity as f64);
+                                choir.queue_note(NoteChange::On(note_id(channel, note), note, velocity as f64));
                                 self.shared.held[note as usize & 127].store(true, Ordering::Relaxed);
                             }
                             NoteEvent::NoteOff { channel, note, .. } | NoteEvent::Choke { channel, note, .. } => {
-                                choir.note_off(note_id(channel, note));
+                                choir.queue_note(NoteChange::Off(note_id(channel, note)));
                                 self.shared.held[note as usize & 127].store(false, Ordering::Relaxed);
                             }
-                            NoteEvent::PolyTuning { channel, note, tuning, .. } => choir.note_pitch_bend(note_id(channel, note), tuning as f64),
-                            NoteEvent::PolyPressure { channel, note, pressure, .. } => choir.note_pressure(note_id(channel, note), pressure as f64),
-                            NoteEvent::PolyBrightness { channel, note, brightness, .. } => choir.note_brightness(note_id(channel, note), brightness as f64),
+                            NoteEvent::PolyTuning { channel, note, tuning, .. } => { choir.flush_notes(); choir.note_pitch_bend(note_id(channel, note), tuning as f64); },
+                            NoteEvent::PolyPressure { channel, note, pressure, .. } => { choir.flush_notes(); choir.note_pressure(note_id(channel, note), pressure as f64); },
+                            NoteEvent::PolyBrightness { channel, note, brightness, .. } => { choir.flush_notes(); choir.note_brightness(note_id(channel, note), brightness as f64); },
                             // rueda de afinación: ±2 semitonos
                             NoteEvent::MidiPitchBend { value, .. } => choir.set_pitch_bend((value as f64 - 0.5) * 4.0),
                             // CC 120 / 123: mismo alcance global que en la app.
@@ -672,6 +688,7 @@ impl Plugin for Orfeon {
                     _ => break,
                 }
             }
+            choir.flush_notes();
             choir.render(&mut left[pos..end], &mut right[pos..end]);
             pos = end;
         }
