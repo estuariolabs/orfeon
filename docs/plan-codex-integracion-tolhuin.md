@@ -123,6 +123,49 @@ Opciones a evaluar, con pros, contras y costo:
 **Entregable:** documento con la especificación del protocolo elegido (mensajes, canales,
 qué pasa si se pierde un mensaje) y un plan por etapas con estimación.
 
+## Fase 4 — Vocales desde el micrófono (propuesta + prototipo en la app)
+
+Idea del autor (como "The Mouth" para Reaktor): el coro toma la **forma de la boca** de una voz
+que entra por micrófono, mientras las notas vienen de la Tolhuin o del teclado.
+
+**No es un vocoder:** se mide la *postura* (vocal) y cada cantante la aplica a su propio tracto,
+así siguen siendo cuerpos distintos.
+
+1. Cada ~10 ms, estimar F1/F2 de la entrada (LPC; CHIMERA trae `analysis/lpc.rs` y
+   `analysis/pitch.rs`: verificar que sirvan en tiempo real y no reserven memoria).
+2. Convertir F1/F2 en un punto de la carta de vocales (`vowel_x`, `vowel_y`). Propuesta:
+   tabla precalculada con el propio modelo (`airway/frequency.rs` da los formantes de cada
+   punto de la carta para cada cuerpo) y búsqueda del más cercano, normalizando por el
+   hablante.
+3. Volumen de la entrada → presión de pulmones; relación ruido/armónicos → aire.
+4. Sólo en la app (entrada de micrófono con cpal). El plugin con entrada lateral queda para
+   después.
+
+**Riesgos a resolver:** acople (micrófono que escucha los parlantes: pedir auriculares,
+compuerta de ruido), latencia del análisis (~20–30 ms), F1 poco confiable en voces agudas
+(suavizar y descartar lecturas raras).
+
+**Criterio de aceptación:** con un acorde sostenido, decir "aaa-eee-iii-ooo-uuu" al micrófono y
+que las cinco vocales se reconozcan a oído en el coro, sin saltos; la interfaz muestra el
+punto medido y la demora.
+
+## Orden de trabajo acordado
+
+1. Robustez MIDI y pánico visible (fase 1).
+2. Preset SATB, conducción de voces por costo (registro, distancia a la última nota del
+   cantante, sin cruces), tonos comunes por diffs y fraseo escalonado. Detrás de un
+   interruptor: con él apagado, los 36 programas actuales suenan idéntico byte a byte.
+3. Vocales desde el micrófono (fase 4), en la app.
+4. Joystick expresivo (CC de la Tolhuin → vocal, vibrato, brillo), reutilizando el mismo
+   punto de la carta.
+5. Canal MIDI por voz (S, A, T, B) en Tolhuin y Orfeón.
+6. Letra en español (fase 2).
+7. Micrófono en el plugin (entrada lateral) y consonantes desde el micrófono.
+
+Compatibilidad en todas las fases: no cambiar IDs de parámetros ni el orden de los enums (el
+plugin guarda los enums por índice); presets nuevos sólo al final de `PRESETS` (el plugin
+guarda el programa por índice).
+
 ## Verificación que el agente tiene que correr
 
 - Orfeón: `cargo test --release` (16 tests) y, si toca el núcleo, comparar renders con la
